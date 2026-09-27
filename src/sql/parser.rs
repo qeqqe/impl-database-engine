@@ -1835,4 +1835,220 @@ mod tests {
             _ => panic!("Expected Select"),
         }
     }
+
+    fn select(sql: &str) -> Select {
+        match Parser::parse(sql).unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("Expected Select, got {:?}", other),
+        }
+    }
+
+    fn unsupported(sql: &str) -> String {
+        match Parser::parse(sql) {
+            Err(ParseError::UnsupportedStatement(msg))
+            | Err(ParseError::UnsupportedExpression(msg)) => msg,
+            other => panic!("Expected unsupported error for {sql}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_select_distinct() {
+        assert!(select("SELECT DISTINCT name FROM users").distinct);
+        assert!(!select("SELECT name FROM users").distinct);
+        assert!(unsupported("SELECT DISTINCT ON (a) a FROM t").contains("DISTINCT ON"));
+    }
+
+    #[test]
+    fn test_order_by_keeps_qualifier_and_expressions() {
+        let s =
+            select("SELECT * FROM a JOIN b ON a.id = b.id ORDER BY b.id DESC NULLS LAST, a.x + 1");
+        assert_eq!(
+            s.order_by[0],
+            OrderBy {
+                expr: Expr::Column {
+                    table: Some("b".into()),
+                    name: "id".into(),
+                },
+                ascending: false,
+                nulls_first: Some(false),
+            }
+        );
+        assert!(matches!(s.order_by[1].expr, Expr::BinaryOp { .. }));
+    }
+
+    #[test]
+    fn test_limit_must_be_literal() {
+        assert!(unsupported("SELECT * FROM t LIMIT x").contains("LIMIT"));
+        assert!(Parser::parse("SELECT * FROM t LIMIT -1").is_err());
+        let s = select("SELECT * FROM t LIMIT 3, 7");
+        assert_eq!((s.limit, s.offset), (Some(7), Some(3)));
+    }
+
+    #[test]
+    fn test_count_star_and_distinct_arguments() {
+        let s = select("SELECT COUNT(*), COUNT(DISTINCT a) FROM t");
+        match &s.columns[0] {
+            SelectColumn::Expr {
+                expr: Expr::Function { args, .. },
+                ..
+            } => assert_eq!(*args, FunctionArgs::Star),
+            other => panic!("Expected COUNT(*), got {:?}", other),
+        }
+        match &s.columns[1] {
+            SelectColumn::Expr {
+                expr:
+                    Expr::Function {
+                        args: FunctionArgs::List { args, distinct },
+                        ..
+                    },
+                ..
+            } => {
+                assert!(*distinct);
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("Expected COUNT(DISTINCT a), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_window_and_filter_clauses_rejected() {
+        assert!(unsupported("SELECT COUNT(*) OVER () FROM t").contains("window"));
+        assert!(unsupported("SELECT COUNT(*) FILTER (WHERE a > 1) FROM t").contains("FILTER"));
+        assert!(unsupported("SELECT a FROM t WINDOW w AS (PARTITION BY a)").contains("WINDOW"));
+    }
+
+    #[test]
+    fn test_ilike_and_like_escape() {
+        let s = select("SELECT * FROM t WHERE a ILIKE 'x%'");
+        assert!(matches!(
+            s.where_clause,
+            Some(Expr::Like {
+                case_insensitive: true,
+                ..
+            })
+        ));
+        assert!(unsupported("SELECT * FROM t WHERE a LIKE 'x!%' ESCAPE '!'").contains("ESCAPE"));
+    }
+
+    #[test]
+    fn test_comma_join_becomes_cross_join() {
+        let s = select("SELECT * FROM a, b AS bb JOIN c ON bb.id = c.id");
+        assert_eq!(s.from.base, "a");
+        assert_eq!(s.from.joins.len(), 2);
+        assert_eq!(s.from.joins[0].join_type, JoinType::Cross);
+        assert_eq!(s.from.joins[0].alias.as_deref(), Some("bb"));
+        assert_eq!(s.from.joins[1].join_type, JoinType::Inner);
+    }
+
+    #[test]
+    fn test_cte_and_set_operations_rejected() {
+        assert!(unsupported("WITH x AS (SELECT 1) SELECT * FROM x").contains("WITH"));
+        assert!(Parser::parse("SELECT a FROM t UNION SELECT a FROM u").is_err());
+    }
+
+    #[test]
+    fn test_insert_select_source() {
+        match Parser::parse("INSERT INTO t (a) SELECT b FROM u WHERE b > 1").unwrap() {
+            Statement::Insert(i) => match i.source {
+                InsertSource::Select(s) => assert_eq!(s.from.base, "u"),
+                other => panic!("Expected SELECT source, got {:?}", other),
+            },
+            other => panic!("Expected Insert, got {:?}", other),
+        }
+        assert!(
+            unsupported("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING").contains("ON CONFLICT")
+        );
+        assert!(unsupported("INSERT INTO t VALUES (1) RETURNING a").contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_update_alias_and_qualified_target() {
+        match Parser::parse("UPDATE users u SET u.name = 'x' WHERE u.id = 1").unwrap() {
+            Statement::Update(u) => {
+                assert_eq!(u.alias.as_deref(), Some("u"));
+                assert_eq!(u.assignments[0].column, "name");
+            }
+            other => panic!("Expected Update, got {:?}", other),
+        }
+        assert!(matches!(
+            Parser::parse("UPDATE users SET other.name = 'x'"),
+            Err(ParseError::InvalidIdentifier(_))
+        ));
+        assert!(Parser::parse("UPDATE users SET (a, b) = (1, 2)").is_err());
+    }
+
+    #[test]
+    fn test_delete_alias_and_unsupported_clauses() {
+        match Parser::parse("DELETE FROM users AS u WHERE u.id = 1").unwrap() {
+            Statement::Delete(d) => assert_eq!(d.alias.as_deref(), Some("u")),
+            other => panic!("Expected Delete, got {:?}", other),
+        }
+        assert!(unsupported("DELETE FROM users RETURNING id").contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_create_table_keys() {
+        match Parser::parse(
+            "CREATE TABLE t (a INT, b TEXT, c INT UNIQUE, PRIMARY KEY (b, a), UNIQUE (a, c))",
+        )
+        .unwrap()
+        {
+            Statement::CreateTable(ct) => {
+                assert_eq!(ct.primary_key, vec!["b".to_string(), "a".to_string()]);
+                assert_eq!(
+                    ct.unique_keys,
+                    vec![
+                        vec!["c".to_string()],
+                        vec!["a".to_string(), "c".to_string()]
+                    ]
+                );
+                assert!(
+                    ct.columns[0]
+                        .constraints
+                        .contains(&ColumnConstraint::PrimaryKey)
+                );
+                assert!(
+                    !ct.columns[0]
+                        .constraints
+                        .contains(&ColumnConstraint::Unique)
+                );
+                assert!(
+                    ct.columns[2]
+                        .constraints
+                        .contains(&ColumnConstraint::Unique)
+                );
+            }
+            other => panic!("Expected CreateTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_table_rejections() {
+        assert!(Parser::parse("CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)").is_err());
+        assert!(Parser::parse("CREATE TABLE t (a INT PRIMARY KEY, PRIMARY KEY (a))").is_err());
+        assert!(matches!(
+            Parser::parse("CREATE TABLE t (a INT, PRIMARY KEY (missing))"),
+            Err(ParseError::InvalidIdentifier(_))
+        ));
+        assert!(unsupported("CREATE TABLE t (a INT CHECK (a > 0))").contains("CHECK"));
+        assert!(unsupported("CREATE TABLE t (a INT REFERENCES u(id))").contains("REFERENCES"));
+        assert!(unsupported("CREATE TABLE t AS SELECT 1").contains("AS SELECT"));
+    }
+
+    #[test]
+    fn test_expr_display_round_trips_readably() {
+        let s = select("SELECT COUNT(DISTINCT a), b || 'x', c NOT BETWEEN 1 AND 2 FROM t");
+        let rendered: Vec<String> = s
+            .columns
+            .iter()
+            .map(|c| match c {
+                SelectColumn::Expr { expr, .. } => expr.to_string(),
+                other => format!("{:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec!["COUNT(DISTINCT a)", "b || 'x'", "c NOT BETWEEN 1 AND 2"]
+        );
+    }
 }
