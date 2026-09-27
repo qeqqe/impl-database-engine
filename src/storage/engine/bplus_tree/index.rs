@@ -1,9 +1,9 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{error::Error, fs::File, os::unix::fs::FileExt, path::PathBuf};
 
-use crate::storage::engine::read_intensive::bplus_tree::{PageKind, header::IndexHeader};
+use crate::storage::engine::bplus_tree::{PageKind, header::IndexHeader};
 
 use super::{PAGE_SIZE, buffer_pool::BufferPool, slotted_page::Page, wal::Wal};
 
@@ -198,4 +198,3 @@ impl Index {
         id * PAGE_SIZE as u64
     }
 }
-

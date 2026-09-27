@@ -67,7 +67,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "impl-storage-engine"
+name = "impl-database-engine"
 version = "0.1.0"
 dependencies = [
  "sqlparser",
