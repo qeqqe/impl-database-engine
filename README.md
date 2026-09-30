@@ -1,3 +1,3 @@
-toy database implementation from scratch.
+toy database engine implementation from scratch.
 
 LLMs have not been used in the development of this software and LLM generated code is not present in the source tree...
