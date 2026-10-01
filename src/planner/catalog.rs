@@ -11,6 +11,13 @@ use crate::{
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+
+    // NOTE:  This is a `Vec<usize>` because all our consumer will want a position
+    // the executor usually extracts the key from a row by index, and the
+    // physical planner compares a key column with a SCAN's projection list of
+    // indices, names would be looked up over and over, case insensitively, with
+    // the chance of a typo that is only found at runtime, so we resolve once,
+    // when the table is created, and fail early if a key names a missing column
     pub primary_key: Vec<usize>,
     pub unique_keys: Vec<Vec<usize>>,
 }
