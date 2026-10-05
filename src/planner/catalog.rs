@@ -8,6 +8,7 @@ use crate::{
     sql::{ColumnConstraint, ColumnDef, CreateTable},
 };
 
+#[derive(Debug, PartialEq, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
