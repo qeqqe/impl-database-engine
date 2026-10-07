@@ -351,4 +351,3 @@ pub(crate) fn write_joined<T: fmt::Display>(
     }
     Ok(())
 }
-

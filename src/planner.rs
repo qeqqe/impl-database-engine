@@ -1,4 +1,5 @@
 #[allow(dead_code)]
+pub mod binder;
 pub mod catalog;
 pub mod error;
 pub mod expr;

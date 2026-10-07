@@ -1,6 +1,6 @@
 use core::fmt;
 
-use sqlparser::ast::DataType;
+use crate::planner::types::DataType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ColumnId(pub u32);
@@ -17,8 +17,8 @@ pub struct ColumnIdGenerator {
 }
 
 impl ColumnIdGenerator {
-    pub fn next_id(&mut self) -> u32 {
-        let id = self.next;
+    pub fn next_id(&mut self) -> ColumnId {
+        let id = ColumnId(self.next);
         self.next += 1;
         id
     }
