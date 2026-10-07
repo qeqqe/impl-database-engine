@@ -1,8 +1,9 @@
 use crate::planner::expr::{AggregateFunction, ScalarFunction};
+use crate::planner::logical::{LogicalPlan, Plan};
 use crate::planner::schema::ColumnId;
 use crate::planner::types::DataType;
 use crate::planner::value::Value;
-use crate::sql::{BinaryOperator, Expr, FunctionArgs, UnaryOperator};
+use crate::sql::{BinaryOperator, Expr, FunctionArgs, Select, Statement, TableRef, UnaryOperator};
 
 use super::catalog::Catalog;
 use super::error::{PlanError, PlanResult};
@@ -271,6 +272,62 @@ impl ExprBinder<'_> {
         expr: &Expr,
         func: AggregateFunction,
         args: &FunctionArgs,
+    ) -> PlanResult<ScalarExpr> {
+        todo!()
+    }
+}
+
+fn expect_boolean(expr: &ScalarExpr, clause: &str) -> PlanResult<()> {
+    let t = expr.data_type();
+    if t.is_boolean() {
+        Ok(())
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "argument of {clause} must be BOOLEAN, got {t}"
+        )))
+    }
+}
+
+impl<'a> Binder<'a> {
+    pub fn new(catalog: &'a Catalog) -> Self {
+        Self {
+            catalog,
+            ids: ColumnIdGenerator::default(),
+        }
+    }
+
+    pub fn bind(&mut self, statement: &Statement) -> PlanResult<Plan> {
+        match statement {
+            Statement::CreateTable(create) => todo!(),
+            Statement::DropTable(drop) => todo!(),
+            Statement::Select(select) => self.bind_select(select).map(Plan::Query),
+            Statement::Insert(insert) => todo!(),
+            Statement::Update(update) => todo!(),
+            Statement::Delete(delete) => todo!(),
+            Statement::Begin => Ok(Plan::Begin),
+            Statement::Commit => Ok(Plan::Commit),
+            Statement::Rollback => Ok(Plan::Rollback),
+            Statement::ShowTables => Ok(Plan::ShowTables),
+            Statement::Describe(table) => {
+                let schema = self.catalog.get_table(table)?;
+                Ok(Plan::Describe(schema.name.clone()))
+            }
+        }
+    }
+    pub fn bind_select(&mut self, select: &Select) -> PlanResult<LogicalPlan> {
+        todo!()
+    }
+    fn bind_from(&mut self, from: &TableRef) -> PlanResult<(LogicalPlan, Scope)> {
+        todo!()
+    }
+    fn bind_table(&mut self, name: &str, scope: &mut Scope) -> PlanResult<LogicalPlan> {
+        todo!()
+    }
+    fn bind_scalar(
+        &mut self,
+        expr: &Expr,
+        scope: &Scope,
+        clause: &'static str,
     ) -> PlanResult<ScalarExpr> {
         todo!()
     }

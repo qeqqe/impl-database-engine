@@ -119,6 +119,40 @@ impl TableSchema {
     }
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: BTreeMap<String, TableSchema>,
+}
+
+impl Catalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn create_table(&mut self, schema: TableSchema) -> PlanResult<()> {
+        let key = schema.name.to_lowercase();
+        if self.tables.contains_key(&key) {
+            return Err(PlanError::TableAlreadyExists(schema.name));
+        }
+        self.tables.insert(key, schema);
+        Ok(())
+    }
+
+    pub fn get_table(&self, name: &str) -> PlanResult<&TableSchema> {
+        self.tables
+            .get(&name.to_lowercase())
+            .ok_or_else(|| PlanError::TableNotFound(name.to_string()))
+    }
+
+    pub fn has_table(&self, name: &str) -> bool {
+        self.tables.contains_key(&name.to_lowercase())
+    }
+
+    pub fn drop_table(&mut self, name: &str) -> bool {
+        self.tables.remove(&name.to_lowercase()).is_some()
+    }
+
+    pub fn table_names(&self) -> Vec<&str> {
+        self.tables.values().map(|t| t.name.as_str()).collect()
+    }
 }
