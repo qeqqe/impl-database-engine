@@ -1,12 +1,12 @@
 use crate::sql::{
-    Expr, FunctionArgs, LiteralValue, OrderBy, Select, SelectColumn, Statement, TableRef,
-    UnaryOperator,
+    CreateTable, Delete, DropTable, Expr, FunctionArgs, Insert, InsertSource, LiteralValue,
+    OrderBy, Select, SelectColumn, Statement, TableRef, UnaryOperator, Update,
 };
 
-use super::catalog::Catalog;
+use super::catalog::{Catalog, TableSchema};
 use super::error::{PlanError, PlanResult};
 use super::expr::{AggregateCall, AggregateFunction, ScalarExpr, ScalarFunction, SortKey};
-use super::logical::{LogicalPlan, Plan};
+use super::logical::{LogicalPlan, Plan, UpdateAssignment};
 use super::schema::{ColumnIdGenerator, Field, Schema};
 use super::types::DataType;
 use super::value::Value;
@@ -455,13 +455,11 @@ impl<'a> Binder<'a> {
     pub fn bind(&mut self, statement: &Statement) -> PlanResult<Plan> {
         match statement {
             Statement::Select(select) => self.bind_select(select).map(Plan::Query),
-            Statement::Insert(_)
-            | Statement::Update(_)
-            | Statement::Delete(_)
-            | Statement::CreateTable(_)
-            | Statement::DropTable(_) => Err(PlanError::Unsupported(
-                "DML and DDL binding is not implemented yet".into(),
-            )),
+            Statement::Insert(insert) => self.bind_insert(insert),
+            Statement::Update(update) => self.bind_update(update),
+            Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::CreateTable(create) => self.bind_create_table(create),
+            Statement::DropTable(drop) => self.bind_drop_table(drop),
             Statement::Begin => Ok(Plan::Begin),
             Statement::Commit => Ok(Plan::Commit),
             Statement::Rollback => Ok(Plan::Rollback),
@@ -896,6 +894,218 @@ impl<'a> Binder<'a> {
                 .bind_post_aggregate(other, scope, group, "ORDER BY")
                 .map(OrderTarget::Expr),
         }
+    }
+
+    fn bind_insert(&mut self, insert: &Insert) -> PlanResult<Plan> {
+        let catalog = self.catalog;
+        let table = catalog.get_table(&insert.table)?;
+
+        let targets: Vec<usize> = match &insert.columns {
+            None => (0..table.columns.len()).collect(),
+            Some(names) => {
+                let mut targets = Vec::with_capacity(names.len());
+                for name in names {
+                    let index =
+                        table
+                            .column_index(name)
+                            .ok_or_else(|| PlanError::ColumnNotFound {
+                                table: Some(table.name.clone()),
+                                column: name.clone(),
+                            })?;
+                    if targets.contains(&index) {
+                        return Err(PlanError::DuplicateColumn(name.clone()));
+                    }
+                    targets.push(index);
+                }
+                targets
+            }
+        };
+
+        let fields: Vec<Field> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| Field {
+                id: self.ids.next_id(),
+                qualifier: Some(table.name.clone()),
+                name: column.name.clone(),
+                data_type: table.column_type(i),
+                nullable: table.is_nullable(i),
+            })
+            .collect();
+
+        let input = match &insert.source {
+            InsertSource::Values(rows) => {
+                let empty = Scope::default();
+                let mut bound_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if row.len() != targets.len() {
+                        return Err(PlanError::InvalidInsert(format!(
+                            "expected {} values, got {}",
+                            targets.len(),
+                            row.len()
+                        )));
+                    }
+                    let mut provided: Vec<Option<ScalarExpr>> = vec![None; table.columns.len()];
+                    for (value, &target) in row.iter().zip(&targets) {
+                        provided[target] = Some(self.bind_scalar(value, &empty, "VALUES")?);
+                    }
+                    bound_rows.push(self.complete_insert_row(table, provided)?);
+                }
+                LogicalPlan::Values {
+                    rows: bound_rows,
+                    schema: Schema::new(fields),
+                }
+            }
+            InsertSource::Select(select) => {
+                let source = self.bind_select(select)?;
+                let width = source.schema().len();
+                if width != targets.len() {
+                    return Err(PlanError::InvalidInsert(format!(
+                        "INSERT has {} target columns but SELECT returns {width}",
+                        targets.len()
+                    )));
+                }
+                let mut provided: Vec<Option<ScalarExpr>> = vec![None; table.columns.len()];
+                for (field, &target) in source.schema().fields().iter().zip(&targets) {
+                    provided[target] = Some(column_ref(field));
+                }
+                let exprs = self.complete_insert_row(table, provided)?;
+                LogicalPlan::project(source, exprs, fields)
+            }
+        };
+
+        Ok(Plan::Insert {
+            table: table.name.clone(),
+            input,
+        })
+    }
+
+    fn complete_insert_row(
+        &mut self,
+        table: &TableSchema,
+        provided: Vec<Option<ScalarExpr>>,
+    ) -> PlanResult<Vec<ScalarExpr>> {
+        provided
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let value = match value {
+                    Some(v) => v,
+                    None => self.bind_default(table, i)?,
+                };
+                self.coerce_to_column(table, i, value)
+            })
+            .collect()
+    }
+
+    fn bind_default(&mut self, table: &TableSchema, column: usize) -> PlanResult<ScalarExpr> {
+        match table.columns[column].default_value() {
+            Some(expr) => self.bind_scalar(expr, &Scope::default(), "DEFAULT"),
+            None => Ok(ScalarExpr::Literal(Value::Null)),
+        }
+    }
+
+    fn coerce_to_column(
+        &self,
+        table: &TableSchema,
+        column: usize,
+        value: ScalarExpr,
+    ) -> PlanResult<ScalarExpr> {
+        let target = table.column_type(column);
+        let actual = value.data_type();
+        if !actual.can_assign_to(target) {
+            return Err(PlanError::TypeMismatch(format!(
+                "cannot assign {actual} to column {}.{} of type {target}",
+                table.name, table.columns[column].name
+            )));
+        }
+        if !table.is_nullable(column) && matches!(value, ScalarExpr::Literal(Value::Null)) {
+            return Err(PlanError::NotNullViolation {
+                table: table.name.clone(),
+                column: table.columns[column].name.clone(),
+            });
+        }
+        Ok(value.cast(target))
+    }
+
+    fn bind_update(&mut self, update: &Update) -> PlanResult<Plan> {
+        let catalog = self.catalog;
+        let table = catalog.get_table(&update.table)?;
+        let mut scope = Scope::default();
+        let mut plan = self.bind_table(&update.table, update.alias.as_deref(), &mut scope)?;
+        if let Some(where_clause) = &update.where_clause {
+            let predicate = self.bind_scalar(where_clause, &scope, "WHERE")?;
+            expect_boolean(&predicate, "WHERE")?;
+            plan = LogicalPlan::filter(plan, predicate);
+        }
+
+        let mut assignments: Vec<UpdateAssignment> = Vec::with_capacity(update.assignments.len());
+        for assignment in &update.assignments {
+            let column = table.column_index(&assignment.column).ok_or_else(|| {
+                PlanError::ColumnNotFound {
+                    table: Some(table.name.clone()),
+                    column: assignment.column.clone(),
+                }
+            })?;
+            if assignments.iter().any(|a| a.column == column) {
+                return Err(PlanError::DuplicateColumn(assignment.column.clone()));
+            }
+            let value = self.bind_scalar(&assignment.value, &scope, "UPDATE")?;
+            assignments.push(UpdateAssignment {
+                column,
+                value: self.coerce_to_column(table, column, value)?,
+            });
+        }
+
+        Ok(Plan::Update {
+            table: table.name.clone(),
+            input: plan,
+            assignments,
+        })
+    }
+
+    fn bind_delete(&mut self, delete: &Delete) -> PlanResult<Plan> {
+        let catalog = self.catalog;
+        let table = catalog.get_table(&delete.table)?;
+        let mut scope = Scope::default();
+        let mut plan = self.bind_table(&delete.table, delete.alias.as_deref(), &mut scope)?;
+        if let Some(where_clause) = &delete.where_clause {
+            let predicate = self.bind_scalar(where_clause, &scope, "WHERE")?;
+            expect_boolean(&predicate, "WHERE")?;
+            plan = LogicalPlan::filter(plan, predicate);
+        }
+        Ok(Plan::Delete {
+            table: table.name.clone(),
+            input: plan,
+        })
+    }
+
+    fn bind_create_table(&mut self, create: &CreateTable) -> PlanResult<Plan> {
+        if self.catalog.has_table(&create.name) && !create.if_not_exists {
+            return Err(PlanError::TableAlreadyExists(create.name.clone()));
+        }
+        let schema = TableSchema::from_create(create)?;
+        for column in 0..schema.columns.len() {
+            if schema.columns[column].default_value().is_some() {
+                let value = self.bind_default(&schema, column)?;
+                self.coerce_to_column(&schema, column, value)?;
+            }
+        }
+        Ok(Plan::CreateTable {
+            schema,
+            if_not_exists: create.if_not_exists,
+        })
+    }
+
+    fn bind_drop_table(&mut self, drop: &DropTable) -> PlanResult<Plan> {
+        if !drop.if_exists {
+            self.catalog.get_table(&drop.name)?;
+        }
+        Ok(Plan::DropTable {
+            name: drop.name.clone(),
+            if_exists: drop.if_exists,
+        })
     }
 }
 
