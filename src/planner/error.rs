@@ -31,7 +31,7 @@ pub enum PlanError {
     InvalidOrderBy(String),
     PositionOutOfRange {
         clause: &'static str,
-        position: usize,
+        position: i64,
     },
     InvalidInsert(String),
     NotNullViolation {

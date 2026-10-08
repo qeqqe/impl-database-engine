@@ -1,8 +1,11 @@
-use crate::sql::{Expr, FunctionArgs, Select, SelectColumn, Statement, TableRef, UnaryOperator};
+use crate::sql::{
+    Expr, FunctionArgs, LiteralValue, OrderBy, Select, SelectColumn, Statement, TableRef,
+    UnaryOperator,
+};
 
 use super::catalog::Catalog;
 use super::error::{PlanError, PlanResult};
-use super::expr::{AggregateCall, AggregateFunction, ScalarExpr, ScalarFunction};
+use super::expr::{AggregateCall, AggregateFunction, ScalarExpr, ScalarFunction, SortKey};
 use super::logical::{LogicalPlan, Plan};
 use super::schema::{ColumnIdGenerator, Field, Schema};
 use super::types::DataType;
@@ -33,7 +36,6 @@ impl Scope {
         {
             return Err(PlanError::DuplicateAlias(alias.to_string()));
         }
-
         self.relations.push(Relation {
             alias: alias.to_string(),
             fields,
@@ -53,7 +55,6 @@ impl Scope {
             table: table.map(String::from),
             column: column.to_string(),
         };
-
         match table {
             Some(t) => self
                 .relation(t)?
@@ -68,7 +69,6 @@ impl Scope {
                         .find(|f| f.name.eq_ignore_ascii_case(column))
                         .map(|f| (r, f))
                 });
-
                 let (_, field) = matches.next().ok_or_else(not_found)?;
                 let others: Vec<&Relation> = matches.map(|(r, _)| r).collect();
                 if others.is_empty() {
@@ -291,17 +291,49 @@ impl ExprBinder<'_> {
     fn bind_aggregate(
         &mut self,
         expr: &Expr,
-        _func: AggregateFunction,
-        _args: &FunctionArgs,
+        func: AggregateFunction,
+        args: &FunctionArgs,
     ) -> PlanResult<ScalarExpr> {
         match &self.mode {
-            AggregateMode::Forbidden(clause) => Err(PlanError::AggregateNotAllowed { clause }),
-            AggregateMode::InsideAggregate(outer) => {
-                Err(PlanError::NestedAggregate(format!("{expr} inside {outer}")))
+            AggregateMode::Forbidden(clause) => {
+                return Err(PlanError::AggregateNotAllowed { clause });
             }
-            AggregateMode::Allowed(_) => Err(PlanError::Unsupported(format!(
-                "aggregate {expr} is not bound yet"
-            ))),
+            AggregateMode::InsideAggregate(outer) => {
+                return Err(PlanError::NestedAggregate(format!("{expr} inside {outer}")));
+            }
+            AggregateMode::Allowed(_) => {}
+        }
+
+        let (arg, distinct) = match args {
+            FunctionArgs::Star => (None, false),
+            FunctionArgs::List { args, distinct } => match args.as_slice() {
+                [single] => {
+                    let mut inner = ExprBinder {
+                        scope: self.scope,
+                        ids: &mut *self.ids,
+                        mode: AggregateMode::InsideAggregate(expr.to_string()),
+                    };
+                    (Some(inner.bind(single)?), *distinct)
+                }
+                _ => {
+                    return Err(PlanError::InvalidAggregate(format!(
+                        "{expr} takes exactly one argument"
+                    )));
+                }
+            },
+        };
+        func.return_type(arg.as_ref().map(ScalarExpr::data_type))?;
+
+        let call = AggregateCall {
+            func,
+            arg,
+            distinct,
+        };
+        match &mut self.mode {
+            AggregateMode::Allowed(set) => Ok(set.register(call, self.ids)),
+            _ => Err(PlanError::Internal(
+                "aggregate mode changed during binding".into(),
+            )),
         }
     }
 }
@@ -314,6 +346,33 @@ fn expect_boolean(expr: &ScalarExpr, clause: &str) -> PlanResult<()> {
         Err(PlanError::TypeMismatch(format!(
             "argument of {clause} must be BOOLEAN, got {t}"
         )))
+    }
+}
+
+fn ast_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { name, args } => {
+            AggregateFunction::from_name(name).is_some()
+                || matches!(args, FunctionArgs::List { args, .. } if args.iter().any(ast_contains_aggregate))
+        }
+        Expr::Column { .. } | Expr::Literal(_) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            ast_contains_aggregate(left) || ast_contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Like { expr, .. }
+        | Expr::Nested(expr) => ast_contains_aggregate(expr),
+        Expr::InList { expr, list, .. } => {
+            ast_contains_aggregate(expr) || list.iter().any(ast_contains_aggregate)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            ast_contains_aggregate(expr)
+                || ast_contains_aggregate(low)
+                || ast_contains_aggregate(high)
+        }
     }
 }
 
@@ -340,6 +399,47 @@ impl BoundItem {
             name: self.name.clone(),
             data_type: self.expr.data_type(),
             nullable: self.expr.nullable(input),
+        }
+    }
+}
+
+enum OrderTarget {
+    Item(usize),
+    Expr(ScalarExpr),
+}
+
+struct GroupContext {
+    group_by: Vec<ScalarExpr>,
+    group_fields: Vec<Field>,
+    aggregates: AggregateSet,
+}
+
+impl GroupContext {
+    fn output_schema(&self) -> Schema {
+        let mut fields = self.group_fields.clone();
+        fields.extend(self.aggregates.fields.iter().cloned());
+        Schema::new(fields)
+    }
+
+    fn rewrite(&self, expr: ScalarExpr, output: &Schema) -> PlanResult<ScalarExpr> {
+        let rewritten = expr.transform_down(&mut |e| {
+            Ok(self
+                .group_by
+                .iter()
+                .position(|g| g == e)
+                .map(|i| column_ref(&self.group_fields[i])))
+        })?;
+        let mut offending = None;
+        rewritten.any(&mut |e| match e {
+            ScalarExpr::Column(c) if !output.contains(c.id) => {
+                offending = Some(c.name.clone());
+                true
+            }
+            _ => false,
+        });
+        match offending {
+            Some(column) => Err(PlanError::NonAggregateColumn { column }),
+            None => Ok(rewritten),
         }
     }
 }
@@ -374,18 +474,6 @@ impl<'a> Binder<'a> {
     }
 
     pub fn bind_select(&mut self, select: &Select) -> PlanResult<LogicalPlan> {
-        if !select.group_by.is_empty()
-            || select.having.is_some()
-            || !select.order_by.is_empty()
-            || select.distinct
-            || select.limit.is_some()
-            || select.offset.is_some()
-        {
-            return Err(PlanError::Unsupported(
-                "GROUP BY, HAVING, ORDER BY, DISTINCT, LIMIT and OFFSET".into(),
-            ));
-        }
-
         let (mut plan, scope) = self.bind_from(&select.from)?;
 
         if let Some(where_clause) = &select.where_clause {
@@ -395,11 +483,81 @@ impl<'a> Binder<'a> {
         }
 
         let sources = self.expand_select_items(&select.columns, &scope)?;
-        let items = sources
+
+        let grouped = !select.group_by.is_empty()
+            || select.having.is_some()
+            || sources
+                .iter()
+                .any(|s| matches!(s, ItemSource::Ast { expr, .. } if ast_contains_aggregate(expr)))
+            || select
+                .order_by
+                .iter()
+                .any(|o| ast_contains_aggregate(&o.expr));
+
+        let mut group = if grouped {
+            Some(self.bind_group_by(&select.group_by, &sources, &scope, plan.schema())?)
+        } else {
+            None
+        };
+
+        let mut items = sources
             .iter()
-            .map(|source| self.bind_item(source, &scope))
+            .map(|source| self.bind_item(source, &scope, group.as_mut()))
             .collect::<PlanResult<Vec<_>>>()?;
 
+        let having = select
+            .having
+            .as_ref()
+            .map(|h| self.bind_post_aggregate(h, &scope, group.as_mut(), "HAVING"))
+            .transpose()?;
+
+        let order_targets = select
+            .order_by
+            .iter()
+            .map(|ob| self.bind_order_target(ob, &sources, &items, &scope, group.as_mut()))
+            .collect::<PlanResult<Vec<_>>>()?;
+
+        let (plan, items, order_targets) = match group {
+            None => (plan, items, order_targets),
+            Some(group) => {
+                let output = group.output_schema();
+                for item in items.iter_mut() {
+                    item.expr = group.rewrite(item.expr.clone(), &output)?;
+                }
+                let having = having.map(|h| group.rewrite(h, &output)).transpose()?;
+                let order_targets = order_targets
+                    .into_iter()
+                    .map(|t| match t {
+                        OrderTarget::Expr(e) => group.rewrite(e, &output).map(OrderTarget::Expr),
+                        item => Ok(item),
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?;
+
+                plan = LogicalPlan::Aggregate {
+                    input: Box::new(plan),
+                    group_by: group.group_by,
+                    aggregates: group.aggregates.calls,
+                    schema: output,
+                };
+                if let Some(predicate) = having {
+                    expect_boolean(&predicate, "HAVING")?;
+                    plan = LogicalPlan::filter(plan, predicate);
+                }
+                (plan, items, order_targets)
+            }
+        };
+
+        self.finish_select(plan, select, items, order_targets)
+    }
+
+    fn finish_select(
+        &mut self,
+        plan: LogicalPlan,
+        select: &Select,
+        items: Vec<BoundItem>,
+        order_targets: Vec<OrderTarget>,
+    ) -> PlanResult<LogicalPlan> {
+        let visible = items.len();
         let mut exprs: Vec<ScalarExpr> = Vec::with_capacity(items.len());
         let mut fields: Vec<Field> = Vec::with_capacity(items.len());
         for item in &items {
@@ -407,7 +565,72 @@ impl<'a> Binder<'a> {
             exprs.push(item.expr.clone());
         }
 
-        Ok(LogicalPlan::project(plan, exprs, fields))
+        let mut sort_positions = Vec::with_capacity(order_targets.len());
+        for target in order_targets {
+            let position = match target {
+                OrderTarget::Item(i) => i,
+                OrderTarget::Expr(expr) => match exprs.iter().position(|e| e == &expr) {
+                    Some(i) => i,
+                    None => {
+                        if select.distinct {
+                            return Err(PlanError::InvalidOrderBy(format!(
+                                "for SELECT DISTINCT, ORDER BY expression {expr} must appear in the select list"
+                            )));
+                        }
+                        let hidden = BoundItem {
+                            name: expr.to_string(),
+                            qualifier: None,
+                            expr,
+                        };
+                        fields.push(hidden.field(plan.schema(), &mut self.ids));
+                        exprs.push(hidden.expr);
+                        exprs.len() - 1
+                    }
+                },
+            };
+            sort_positions.push(position);
+        }
+
+        let mut plan = LogicalPlan::project(plan, exprs, fields.clone());
+
+        if select.distinct {
+            plan = LogicalPlan::Distinct {
+                input: Box::new(plan),
+            };
+        }
+
+        if !select.order_by.is_empty() {
+            let keys = select
+                .order_by
+                .iter()
+                .zip(sort_positions)
+                .map(|(ob, position)| SortKey {
+                    expr: column_ref(&fields[position]),
+                    ascending: ob.ascending,
+                    nulls_first: ob.nulls_first.unwrap_or(!ob.ascending),
+                })
+                .collect();
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                keys,
+            };
+        }
+
+        if select.limit.is_some() || select.offset.is_some() {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                limit: select.limit,
+                offset: select.offset.unwrap_or(0),
+            };
+        }
+
+        if fields.len() > visible {
+            let visible_fields = fields[..visible].to_vec();
+            let exprs = visible_fields.iter().map(column_ref).collect();
+            plan = LogicalPlan::project(plan, exprs, visible_fields);
+        }
+
+        Ok(plan)
     }
 
     fn bind_from(&mut self, from: &TableRef) -> PlanResult<(LogicalPlan, Scope)> {
@@ -472,6 +695,24 @@ impl<'a> Binder<'a> {
         .bind(expr)
     }
 
+    fn bind_post_aggregate(
+        &mut self,
+        expr: &Expr,
+        scope: &Scope,
+        group: Option<&mut GroupContext>,
+        clause: &'static str,
+    ) -> PlanResult<ScalarExpr> {
+        match group {
+            Some(group) => ExprBinder {
+                scope,
+                ids: &mut self.ids,
+                mode: AggregateMode::Allowed(&mut group.aggregates),
+            }
+            .bind(expr),
+            None => self.bind_scalar(expr, scope, clause),
+        }
+    }
+
     fn expand_select_items<'q>(
         &self,
         columns: &'q [SelectColumn],
@@ -509,7 +750,12 @@ impl<'a> Binder<'a> {
         Ok(out)
     }
 
-    fn bind_item(&mut self, source: &ItemSource<'_>, scope: &Scope) -> PlanResult<BoundItem> {
+    fn bind_item(
+        &mut self,
+        source: &ItemSource<'_>,
+        scope: &Scope,
+        group: Option<&mut GroupContext>,
+    ) -> PlanResult<BoundItem> {
         match source {
             ItemSource::Field(field) => Ok(BoundItem {
                 expr: column_ref(field),
@@ -517,7 +763,7 @@ impl<'a> Binder<'a> {
                 qualifier: field.qualifier.clone(),
             }),
             ItemSource::Ast { expr, alias } => {
-                let bound = self.bind_scalar(expr, scope, "SELECT")?;
+                let bound = self.bind_post_aggregate(expr, scope, group, "SELECT")?;
                 let (name, qualifier) = match (alias, &bound, expr) {
                     (Some(alias), _, _) => (alias.to_string(), None),
                     (None, ScalarExpr::Column(c), Expr::Column { .. }) => {
@@ -536,4 +782,131 @@ impl<'a> Binder<'a> {
             }
         }
     }
+
+    fn bind_group_by(
+        &mut self,
+        group_by: &[Expr],
+        sources: &[ItemSource<'_>],
+        scope: &Scope,
+        input: &Schema,
+    ) -> PlanResult<GroupContext> {
+        let mut exprs: Vec<ScalarExpr> = Vec::with_capacity(group_by.len());
+        for expr in group_by {
+            let bound = match expr {
+                Expr::Literal(LiteralValue::Integer(position)) => {
+                    let source = select_item_at(sources, *position, "GROUP BY")?;
+                    self.bind_source_scalar(source, scope, "GROUP BY")?
+                }
+                Expr::Column { table: None, name } => {
+                    match self.bind_scalar(expr, scope, "GROUP BY") {
+                        Err(PlanError::ColumnNotFound { .. }) => {
+                            let source = sources
+                            .iter()
+                            .find(|s| matches!(s, ItemSource::Ast { alias: Some(a), .. } if a.eq_ignore_ascii_case(name)))
+                            .ok_or_else(|| PlanError::ColumnNotFound {
+                                table: None,
+                                column: name.clone(),
+                            })?;
+                            self.bind_source_scalar(source, scope, "GROUP BY")?
+                        }
+                        other => other?,
+                    }
+                }
+                other => self.bind_scalar(other, scope, "GROUP BY")?,
+            };
+            if !exprs.contains(&bound) {
+                exprs.push(bound);
+            }
+        }
+
+        let group_fields = exprs
+            .iter()
+            .map(|expr| match expr {
+                ScalarExpr::Column(c) => input
+                    .index_of(c.id)
+                    .map(|i| input.field(i).clone())
+                    .ok_or_else(|| {
+                        PlanError::Internal(format!("group column {} not in input", c.name))
+                    }),
+                other => Ok(Field {
+                    id: self.ids.next_id(),
+                    qualifier: None,
+                    name: other.to_string(),
+                    data_type: other.data_type(),
+                    nullable: other.nullable(input),
+                }),
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+
+        Ok(GroupContext {
+            group_by: exprs,
+            group_fields,
+            aggregates: AggregateSet::default(),
+        })
+    }
+
+    fn bind_source_scalar(
+        &mut self,
+        source: &ItemSource<'_>,
+        scope: &Scope,
+        clause: &'static str,
+    ) -> PlanResult<ScalarExpr> {
+        match source {
+            ItemSource::Field(field) => Ok(column_ref(field)),
+            ItemSource::Ast { expr, .. } => self.bind_scalar(expr, scope, clause),
+        }
+    }
+
+    fn bind_order_target(
+        &mut self,
+        order_by: &OrderBy,
+        sources: &[ItemSource<'_>],
+        items: &[BoundItem],
+        scope: &Scope,
+        group: Option<&mut GroupContext>,
+    ) -> PlanResult<OrderTarget> {
+        match &order_by.expr {
+            Expr::Literal(LiteralValue::Integer(position)) => {
+                select_item_at(sources, *position, "ORDER BY")?;
+                Ok(OrderTarget::Item(*position as usize - 1))
+            }
+            Expr::Column { table: None, name } => {
+                let matching: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.name.eq_ignore_ascii_case(name))
+                    .map(|(i, _)| i)
+                    .collect();
+                match matching.as_slice() {
+                    [] => self
+                        .bind_post_aggregate(&order_by.expr, scope, group, "ORDER BY")
+                        .map(OrderTarget::Expr),
+                    [first, rest @ ..] => {
+                        if rest.iter().all(|i| items[*i].expr == items[*first].expr) {
+                            Ok(OrderTarget::Item(*first))
+                        } else {
+                            Err(PlanError::InvalidOrderBy(format!(
+                                "ORDER BY {name} is ambiguous"
+                            )))
+                        }
+                    }
+                }
+            }
+            other => self
+                .bind_post_aggregate(other, scope, group, "ORDER BY")
+                .map(OrderTarget::Expr),
+        }
+    }
+}
+
+fn select_item_at<'s, 'q>(
+    sources: &'s [ItemSource<'q>],
+    position: i64,
+    clause: &'static str,
+) -> PlanResult<&'s ItemSource<'q>> {
+    usize::try_from(position)
+        .ok()
+        .and_then(|p| p.checked_sub(1))
+        .and_then(|p| sources.get(p))
+        .ok_or(PlanError::PositionOutOfRange { clause, position })
 }
