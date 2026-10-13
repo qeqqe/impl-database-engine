@@ -1,10 +1,12 @@
+#![allow(dead_code)]
 //! An optimizer rewrites a plan into an equivalent one that cat be more
 //! efficient to execute
 mod constant_folding;
 
 use crate::planner::{
     error::PlanResult,
-    logical::{LogicalPlan, Plan},
+    logical::{LogicalPlan, Plan, UpdateAssignment},
+    optimizer::constant_folding::fold_expr,
 };
 
 pub trait OptimizerRule {
@@ -12,7 +14,7 @@ pub trait OptimizerRule {
     fn rewrite(&self, plan: LogicalPlan) -> PlanResult<LogicalPlan>;
 }
 
-struct Optimizer {
+pub struct Optimizer {
     rules: Vec<Box<dyn OptimizerRule>>,
 }
 
@@ -51,8 +53,15 @@ impl Optimizer {
             } => Plan::Update {
                 table,
                 input: self.optimize(input)?,
-
-                assignments: assignments, // TODO: fold assignment's values expr
+                assignments: assignments
+                    .into_iter()
+                    .map(|a| {
+                        Ok(UpdateAssignment {
+                            column: a.column,
+                            value: fold_expr(a.value)?,
+                        })
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?,
             },
             Plan::Delete { table, input } => Plan::Delete {
                 table,
@@ -60,5 +69,29 @@ impl Optimizer {
             },
             other => other,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::planner::{expr::ScalarExpr, plan_sql, test_catalog::catalog};
+
+    use super::*;
+
+    // fn optimized(sql: &str) -> String {
+    //     match plan_sql(&catalog(), sql).unwrap() {
+    //         Plan::Query(plan) => plan.to_string(),
+    //         other => panic!("expected query, got {other:?}"),
+    //     }
+    // }
+
+    #[test]
+    fn update_assignments_are_folded() {
+        let Plan::Update { assignments, .. } =
+            plan_sql(&catalog(), "UPDATE users SET age = 1 + 1").unwrap()
+        else {
+            panic!("expected update");
+        };
+        assert_eq!(assignments[0].value, ScalarExpr::literal(2i64));
     }
 }
