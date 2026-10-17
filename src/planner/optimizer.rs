@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 mod constant_folding;
 mod predicate_pushdown;
+mod projection_pruning;
 
 use crate::planner::{
     error::PlanResult,
@@ -11,6 +12,7 @@ use crate::planner::{
     optimizer::{
         constant_folding::{ConstantFolding, fold_expr},
         predicate_pushdown::PredicatePushdown,
+        projection_pruning::ProjectionPruning,
     },
 };
 
@@ -25,7 +27,11 @@ pub struct Optimizer {
 
 impl Default for Optimizer {
     fn default() -> Self {
-        Self::new(vec![Box::new(ConstantFolding), Box::new(PredicatePushdown)])
+        Self::new(vec![
+            Box::new(ConstantFolding),
+            Box::new(PredicatePushdown),
+            Box::new(ProjectionPruning),
+        ])
     }
 }
 
