@@ -1,12 +1,17 @@
-#![allow(dead_code)]
 //! An optimizer rewrites a plan into an equivalent one that cat be more
 //! efficient to execute
+
+#![allow(dead_code)]
 mod constant_folding;
+mod predicate_pushdown;
 
 use crate::planner::{
     error::PlanResult,
     logical::{LogicalPlan, Plan, UpdateAssignment},
-    optimizer::constant_folding::fold_expr,
+    optimizer::{
+        constant_folding::{ConstantFolding, fold_expr},
+        predicate_pushdown::PredicatePushdown,
+    },
 };
 
 pub trait OptimizerRule {
@@ -20,7 +25,7 @@ pub struct Optimizer {
 
 impl Default for Optimizer {
     fn default() -> Self {
-        Self::new(vec![])
+        Self::new(vec![Box::new(ConstantFolding), Box::new(PredicatePushdown)])
     }
 }
 
