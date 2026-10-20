@@ -2,7 +2,12 @@ use core::fmt;
 use std::ops::Bound;
 
 use crate::{
-    planner::{expr::AggregateFunction, physical_expr::PhysExpr, schema::Schema},
+    planner::{
+        expr::AggregateFunction,
+        logical::{ColumnList, write_joined},
+        physical_expr::PhysExpr,
+        schema::Schema,
+    },
     sql::JoinType,
 };
 // tis stores the node's id range
@@ -29,7 +34,7 @@ impl KeyRange {
 
     pub fn contains(&self, key: i64) -> bool {
         let above_lower = match self.lower {
-            Bound::Included(l) => key > l,
+            Bound::Included(l) => key >= l,
             Bound::Excluded(l) => key > l,
             Bound::Unbounded => true,
         };
@@ -189,4 +194,158 @@ pub enum PhysicalPlan {
     Distinct {
         input: Box<PhysicalPlan>,
     },
+}
+
+impl PhysicalPlan {
+    pub fn schema(&self) -> &Schema {
+        match self {
+            PhysicalPlan::SeqScan { schema, .. }
+            | PhysicalPlan::IndexScan { schema, .. }
+            | PhysicalPlan::Values { schema, .. }
+            | PhysicalPlan::Project { schema, .. }
+            | PhysicalPlan::NestedLoopJoin { schema, .. }
+            | PhysicalPlan::HashJoin { schema, .. }
+            | PhysicalPlan::HashAggregate { schema, .. } => schema,
+
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::TopN { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Distinct { input } => input.schema(),
+        }
+    }
+
+    pub fn children(&self) -> Vec<&PhysicalPlan> {
+        match self {
+            PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::IndexScan { .. }
+            | PhysicalPlan::Values { .. } => vec![],
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::HashAggregate { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::TopN { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Distinct { input } => vec![input],
+            PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::HashJoin { left, right, .. } => vec![left, right],
+        }
+    }
+
+    fn describe(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PhysicalPlan::SeqScan { table, schema, .. } => {
+                write!(f, "SeqScan: {table} {}", ColumnList(schema))
+            }
+            PhysicalPlan::IndexScan {
+                table,
+                range,
+                schema,
+                ..
+            } => write!(
+                f,
+                "IndexScan: {table} key in {range} {}",
+                ColumnList(schema)
+            ),
+            PhysicalPlan::Values { rows, schema } => {
+                write!(f, "Values: {} rows {}", rows.len(), ColumnList(schema))
+            }
+            PhysicalPlan::Filter { predicate, .. } => write!(f, "Filter: {predicate}"),
+            PhysicalPlan::Project { exprs, .. } => {
+                f.write_str("Project: ")?;
+                write_joined(f, exprs)
+            }
+            PhysicalPlan::NestedLoopJoin {
+                join_type,
+                predicate,
+                ..
+            } => {
+                write!(f, "NestedLoopJoin: {join_type}")?;
+                if let Some(p) = predicate {
+                    write!(f, " ON {p}")?;
+                }
+                Ok(())
+            }
+            PhysicalPlan::HashJoin {
+                join_type,
+                left_keys,
+                right_keys,
+                residual,
+                ..
+            } => {
+                write!(f, "HashJoin: {join_type} left=[")?;
+                write_joined(f, left_keys)?;
+                f.write_str("] right=[")?;
+                write_joined(f, right_keys)?;
+                f.write_str("]")?;
+                if let Some(r) = residual {
+                    write!(f, " residual={r}")?;
+                }
+                Ok(())
+            }
+            PhysicalPlan::HashAggregate {
+                group_by,
+                aggregates,
+                ..
+            } => {
+                f.write_str("HashAggregate: group_by=[")?;
+                write_joined(f, group_by)?;
+                f.write_str("] aggregates=[")?;
+                write_joined(f, aggregates)?;
+                f.write_str("]")
+            }
+            PhysicalPlan::Sort { keys, .. } => {
+                f.write_str("Sort: ")?;
+                write_joined(f, keys)
+            }
+            PhysicalPlan::TopN {
+                keys,
+                limit,
+                offset,
+                ..
+            } => {
+                write!(f, "TopN: limit={limit} offset={offset} keys=")?;
+                write_joined(f, keys)
+            }
+            PhysicalPlan::Limit { limit, offset, .. } => match limit {
+                Some(l) => write!(f, "Limit: limit={l} offset={offset}"),
+                None => write!(f, "Limit: limit=ALL offset={offset}"),
+            },
+            PhysicalPlan::Distinct { .. } => f.write_str("Distinct"),
+        }
+    }
+
+    fn fmt_tree(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+        write!(f, "{:indent$}", "", indent = depth * 2)?;
+        self.describe(f)?;
+        writeln!(f)?;
+        for child in self.children() {
+            child.fmt_tree(f, depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for PhysicalPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_tree(f, 0)
+    }
+}
+
+impl fmt::Display for PhysAggregate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let distinct = if self.distinct { "DISTINCT " } else { "" };
+        match &self.arg {
+            None => write!(f, "{}(*)", self.func.name()),
+            Some(arg) => write!(f, "{}({distinct}{arg})", self.func.name()),
+        }
+    }
+}
+
+impl fmt::Display for PhysSortKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let dir = if self.ascending { "ASC" } else { "DESC" };
+        let nulls = if self.nulls_first { "FIRST" } else { "LAST" };
+        write!(f, "{} {dir} NULLS {nulls}", self.expr)
+    }
 }
