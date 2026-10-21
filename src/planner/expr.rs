@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::planner::logical::LogicalPlan;
 use crate::sql::{BinaryOperator, UnaryOperator};
 
 use super::error::{PlanError, PlanResult};
@@ -51,6 +52,22 @@ pub enum ScalarExpr {
         expr: Box<ScalarExpr>,
         to: DataType,
     },
+    Case {
+        branches: Vec<(ScalarExpr, ScalarExpr)>,
+        otherwise: Box<ScalarExpr>,
+    },
+    Subquery {
+        plan: Box<LogicalPlan>,
+    },
+    Exists {
+        plan: Box<LogicalPlan>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<ScalarExpr>,
+        plan: Box<LogicalPlan>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,6 +77,9 @@ pub enum ScalarFunction {
     Length,
     Abs,
     Coalesce,
+    NullIf,
+    Round,
+    Substr,
 }
 
 impl ScalarFunction {
@@ -70,6 +90,9 @@ impl ScalarFunction {
             "LENGTH" | "CHAR_LENGTH" => Some(ScalarFunction::Length),
             "ABS" => Some(ScalarFunction::Abs),
             "COALESCE" => Some(ScalarFunction::Coalesce),
+            "NULLIF" => Some(ScalarFunction::NullIf),
+            "ROUND" => Some(ScalarFunction::Round),
+            "SUBSTR" | "SUBSTRING" => Some(ScalarFunction::Substr),
             _ => None,
         }
     }
@@ -81,6 +104,9 @@ impl ScalarFunction {
             ScalarFunction::Length => "LENGTH",
             ScalarFunction::Abs => "ABS",
             ScalarFunction::Coalesce => "COALESCE",
+            ScalarFunction::NullIf => "NULLIF",
+            ScalarFunction::Round => "ROUND",
+            ScalarFunction::Substr => "SUBSTR",
         }
     }
 
@@ -117,6 +143,32 @@ impl ScalarFunction {
                     .try_fold(DataType::Null, |acc, t| acc.unify(*t))
                     .map_or_else(|| mismatch("arguments of a common type"), Ok)
             }
+            ScalarFunction::NullIf => match args {
+                [a, b] if a.is_comparable_with(*b) => Ok(if a.is_null() { *b } else { *a }),
+                _ => mismatch("two comparable arguments"),
+            },
+            ScalarFunction::Round => match args {
+                [t] if t.is_numeric() || t.is_null() => Ok(*t),
+                [t, digits]
+                    if (t.is_numeric() || t.is_null())
+                        && matches!(digits, DataType::Integer | DataType::Null) =>
+                {
+                    Ok(*t)
+                }
+                _ => mismatch("a numeric argument and an optional INTEGER digit count"),
+            },
+            ScalarFunction::Substr => match args {
+                [s, rest @ ..]
+                    if (s.is_textual() || s.is_null())
+                        && matches!(rest.len(), 1 | 2)
+                        && rest
+                            .iter()
+                            .all(|t| matches!(t, DataType::Integer | DataType::Null)) =>
+                {
+                    Ok(DataType::Text)
+                }
+                _ => mismatch("a TEXT argument, an INTEGER start and an optional INTEGER length"),
+            },
         }
     }
 }
@@ -272,14 +324,30 @@ impl ScalarExpr {
                         .unwrap_or(DataType::Null)
                 }
             }
-            ScalarExpr::IsNull { .. } | ScalarExpr::InList { .. } | ScalarExpr::Like { .. } => {
-                DataType::Boolean
-            }
+            ScalarExpr::IsNull { .. }
+            | ScalarExpr::InList { .. }
+            | ScalarExpr::Like { .. }
+            | ScalarExpr::Exists { .. }
+            | ScalarExpr::InSubquery { .. } => DataType::Boolean,
+            ScalarExpr::Subquery { plan } => plan
+                .schema()
+                .fields()
+                .first()
+                .map_or(DataType::Null, |f| f.data_type),
             ScalarExpr::Function { func, args } => {
                 let types: Vec<DataType> = args.iter().map(ScalarExpr::data_type).collect();
                 func.return_type(&types).unwrap_or(DataType::Null)
             }
             ScalarExpr::Cast { to, .. } => *to,
+            ScalarExpr::Case {
+                branches,
+                otherwise,
+            } => branches
+                .iter()
+                .map(|(_, result)| result.data_type())
+                .chain(std::iter::once(otherwise.data_type()))
+                .try_fold(DataType::Null, DataType::unify)
+                .unwrap_or(DataType::Null),
         }
     }
 
@@ -289,38 +357,80 @@ impl ScalarExpr {
                 .index_of(c.id)
                 .is_none_or(|i| schema.field(i).nullable),
             ScalarExpr::Literal(v) => v.is_null(),
-            ScalarExpr::IsNull { .. } => false,
+            ScalarExpr::IsNull { .. } | ScalarExpr::Exists { .. } => false,
+            ScalarExpr::Subquery { .. } => true,
+            ScalarExpr::InSubquery { expr, plan, .. } => {
+                expr.nullable(schema) || plan.schema().fields().iter().any(|f| f.nullable)
+            }
             ScalarExpr::Function {
                 func: ScalarFunction::Coalesce,
                 args,
             } => args.iter().all(|a| a.nullable(schema)),
+            ScalarExpr::Function {
+                func: ScalarFunction::NullIf,
+                ..
+            } => true,
+            ScalarExpr::Case {
+                branches,
+                otherwise,
+            } => otherwise.nullable(schema) || branches.iter().any(|(_, r)| r.nullable(schema)),
             other => other.children().iter().any(|c| c.nullable(schema)),
         }
     }
 
     pub fn children(&self) -> Vec<&ScalarExpr> {
         match self {
-            ScalarExpr::Column(_) | ScalarExpr::Literal(_) => vec![],
+            ScalarExpr::Column(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Subquery { .. }
+            | ScalarExpr::Exists { .. } => vec![],
             ScalarExpr::Unary { expr, .. }
             | ScalarExpr::IsNull { expr, .. }
             | ScalarExpr::Like { expr, .. }
-            | ScalarExpr::Cast { expr, .. } => vec![expr],
+            | ScalarExpr::Cast { expr, .. }
+            | ScalarExpr::InSubquery { expr, .. } => vec![expr],
             ScalarExpr::Binary { left, right, .. } => vec![left, right],
             ScalarExpr::InList { expr, list, .. } => {
                 std::iter::once(expr.as_ref()).chain(list.iter()).collect()
             }
             ScalarExpr::Function { args, .. } => args.iter().collect(),
+            ScalarExpr::Case {
+                branches,
+                otherwise,
+            } => branches
+                .iter()
+                .flat_map(|(condition, result)| [condition, result])
+                .chain(std::iter::once(otherwise.as_ref()))
+                .collect(),
         }
     }
 
-    pub fn map_children<F>(self, mut f: F) -> PlanResult<ScalarExpr>
+    pub fn map_children<F>(self, f: F) -> PlanResult<ScalarExpr>
     where
         F: FnMut(ScalarExpr) -> PlanResult<ScalarExpr>,
     {
-        let mut boxed =
-            |e: Box<ScalarExpr>| -> PlanResult<Box<ScalarExpr>> { Ok(Box::new(f(*e)?)) };
+        self.try_map_children(f)
+    }
+
+    pub fn try_map_children<E, F>(self, mut f: F) -> Result<ScalarExpr, E>
+    where
+        F: FnMut(ScalarExpr) -> Result<ScalarExpr, E>,
+    {
+        let mut boxed = |e: Box<ScalarExpr>| -> Result<Box<ScalarExpr>, E> { Ok(Box::new(f(*e)?)) };
         Ok(match self {
-            leaf @ (ScalarExpr::Column(_) | ScalarExpr::Literal(_)) => leaf,
+            leaf @ (ScalarExpr::Column(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Subquery { .. }
+            | ScalarExpr::Exists { .. }) => leaf,
+            ScalarExpr::InSubquery {
+                expr,
+                plan,
+                negated,
+            } => ScalarExpr::InSubquery {
+                expr: boxed(expr)?,
+                plan,
+                negated,
+            },
             ScalarExpr::Unary { op, expr } => ScalarExpr::Unary {
                 op,
                 expr: boxed(expr)?,
@@ -343,7 +453,7 @@ impl ScalarExpr {
                 list: list
                     .into_iter()
                     .map(|e| boxed(Box::new(e)).map(|b| *b))
-                    .collect::<PlanResult<Vec<_>>>()?,
+                    .collect::<Result<Vec<_>, E>>()?,
                 negated,
             },
             ScalarExpr::Like {
@@ -362,11 +472,23 @@ impl ScalarExpr {
                 args: args
                     .into_iter()
                     .map(|e| boxed(Box::new(e)).map(|b| *b))
-                    .collect::<PlanResult<Vec<_>>>()?,
+                    .collect::<Result<Vec<_>, E>>()?,
             },
             ScalarExpr::Cast { expr, to } => ScalarExpr::Cast {
                 expr: boxed(expr)?,
                 to,
+            },
+            ScalarExpr::Case {
+                branches,
+                otherwise,
+            } => ScalarExpr::Case {
+                branches: branches
+                    .into_iter()
+                    .map(|(condition, result)| {
+                        Ok((*boxed(Box::new(condition))?, *boxed(Box::new(result))?))
+                    })
+                    .collect::<Result<Vec<_>, E>>()?,
+                otherwise: boxed(otherwise)?,
             },
         })
     }
@@ -375,7 +497,14 @@ impl ScalarExpr {
     where
         F: FnMut(ScalarExpr) -> PlanResult<ScalarExpr>,
     {
-        let rewritten = self.map_children(|child| child.transform_up(f))?;
+        self.try_transform_up(f)
+    }
+
+    pub fn try_transform_up<E, F>(self, f: &mut F) -> Result<ScalarExpr, E>
+    where
+        F: FnMut(ScalarExpr) -> Result<ScalarExpr, E>,
+    {
+        let rewritten = self.try_map_children(|child| child.try_transform_up(f))?;
         f(rewritten)
     }
 
@@ -413,7 +542,18 @@ impl ScalarExpr {
     }
 
     pub fn is_constant(&self) -> bool {
-        !self.any(&mut |e| matches!(e, ScalarExpr::Column(_)))
+        !self.any(&mut |e| matches!(e, ScalarExpr::Column(_)) || e.is_subquery())
+    }
+
+    pub fn is_subquery(&self) -> bool {
+        matches!(
+            self,
+            ScalarExpr::Subquery { .. } | ScalarExpr::Exists { .. } | ScalarExpr::InSubquery { .. }
+        )
+    }
+
+    pub fn contains_subquery(&self) -> bool {
+        self.any(&mut |e| e.is_subquery())
     }
 
     pub fn as_literal_bool(&self) -> Option<Option<bool>> {
@@ -499,6 +639,25 @@ impl fmt::Display for ScalarExpr {
                 f.write_str(")")
             }
             ScalarExpr::Cast { expr, to } => write!(f, "CAST({expr} AS {to})"),
+            ScalarExpr::Case {
+                branches,
+                otherwise,
+            } => {
+                f.write_str("CASE")?;
+                for (condition, result) in branches {
+                    write!(f, " WHEN {condition} THEN {result}")?;
+                }
+                write!(f, " ELSE {otherwise} END")
+            }
+            ScalarExpr::Subquery { .. } => f.write_str("(SUBQUERY)"),
+            ScalarExpr::Exists { negated, .. } => {
+                let not = if *negated { "NOT " } else { "" };
+                write!(f, "{not}EXISTS (SUBQUERY)")
+            }
+            ScalarExpr::InSubquery { expr, negated, .. } => {
+                let not = if *negated { "NOT " } else { "" };
+                write!(f, "{} {not}IN (SUBQUERY)", Paren(expr))
+            }
         }
     }
 }
@@ -511,6 +670,7 @@ impl fmt::Display for Paren<'_> {
             e @ (ScalarExpr::Binary { .. }
             | ScalarExpr::IsNull { .. }
             | ScalarExpr::InList { .. }
+            | ScalarExpr::InSubquery { .. }
             | ScalarExpr::Like { .. }) => write!(f, "({e})"),
             e => write!(f, "{e}"),
         }

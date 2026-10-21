@@ -9,6 +9,7 @@ pub mod optimizer;
 pub mod physical;
 pub mod physical_expr;
 pub mod schema;
+pub mod subquery;
 pub mod test_catalog;
 pub mod types;
 pub mod value;

@@ -2,9 +2,9 @@
 //! efficient to execute
 
 #![allow(dead_code)]
-mod constant_folding;
-mod predicate_pushdown;
-mod projection_pruning;
+pub mod constant_folding;
+pub mod predicate_pushdown;
+pub mod projection_pruning;
 
 use crate::planner::{
     error::PlanResult,

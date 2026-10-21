@@ -1,4 +1,4 @@
-use core::fmt;
+use std::fmt;
 
 use crate::sql::ParseError;
 
@@ -7,6 +7,8 @@ pub enum PlanError {
     Parse(ParseError),
     TableNotFound(String),
     TableAlreadyExists(String),
+    IndexNotFound(String),
+    IndexAlreadyExists(String),
     ColumnNotFound {
         table: Option<String>,
         column: String,
@@ -18,6 +20,7 @@ pub enum PlanError {
     AliasNotFound(String),
     DuplicateAlias(String),
     DuplicateColumn(String),
+    DuplicateConstraint(String),
     AggregateNotAllowed {
         clause: &'static str,
     },
@@ -34,6 +37,7 @@ pub enum PlanError {
         position: i64,
     },
     InvalidInsert(String),
+    InvalidSubquery(String),
     NotNullViolation {
         table: String,
         column: String,
@@ -45,11 +49,13 @@ pub enum PlanError {
 pub type PlanResult<T> = Result<T, PlanError>;
 
 impl fmt::Display for PlanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlanError::Parse(e) => write!(f, "{e}"),
-            PlanError::TableNotFound(name) => write!(f, "No table with named \"{name}\" found."),
-            PlanError::TableAlreadyExists(name) => write!(f, "Table \"{name}\" already exists."),
+            PlanError::TableNotFound(t) => write!(f, "Table not found: {t}"),
+            PlanError::TableAlreadyExists(t) => write!(f, "Table already exists: {t}"),
+            PlanError::IndexNotFound(i) => write!(f, "Index not found: {i}"),
+            PlanError::IndexAlreadyExists(i) => write!(f, "Index already exists: {i}"),
             PlanError::ColumnNotFound {
                 table: Some(t),
                 column,
@@ -66,6 +72,9 @@ impl fmt::Display for PlanError {
             PlanError::AliasNotFound(a) => write!(f, "Table alias not found: {a}"),
             PlanError::DuplicateAlias(a) => write!(f, "Duplicate table alias: {a}"),
             PlanError::DuplicateColumn(c) => write!(f, "Column specified more than once: {c}"),
+            PlanError::DuplicateConstraint(c) => {
+                write!(f, "Constraint name used more than once: {c}")
+            }
             PlanError::AggregateNotAllowed { clause } => {
                 write!(f, "Aggregate functions are not allowed in {clause}")
             }
@@ -84,14 +93,15 @@ impl fmt::Display for PlanError {
                 write!(f, "{clause} position {position} is not in select list")
             }
             PlanError::InvalidInsert(msg) => write!(f, "Invalid INSERT: {msg}"),
+            PlanError::InvalidSubquery(msg) => write!(f, "Invalid subquery: {msg}"),
             PlanError::NotNullViolation { table, column } => {
                 write!(
                     f,
                     "NULL value violates NOT NULL constraint on {table}.{column}"
                 )
             }
-            PlanError::Unsupported(_) => todo!(),
-            PlanError::Internal(_) => todo!(),
+            PlanError::Unsupported(msg) => write!(f, "Unsupported: {msg}"),
+            PlanError::Internal(msg) => write!(f, "Internal planner error: {msg}"),
         }
     }
 }

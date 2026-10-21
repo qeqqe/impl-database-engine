@@ -1,18 +1,32 @@
-use core::fmt;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    CreateIndex(CreateIndex),
+    DropIndex(DropIndex),
+    AlterTable(AlterTable),
     Select(Select),
+    SetOperation(Box<SetOperation>),
     Insert(Insert),
     Update(Update),
     Delete(Delete),
-    Begin,
+    Begin(TransactionMode),
     Commit,
     Rollback,
     ShowTables,
     Describe(String),
+    Explain {
+        analyze: bool,
+        statement: Box<Statement>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionMode {
+    Deferred,
+    Immediate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +35,23 @@ pub struct CreateTable {
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<String>,
     pub unique_keys: Vec<Vec<String>>,
+    pub checks: Vec<CheckConstraint>,
     pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    pub expr: Expr,
+}
+
+impl fmt::Display for CheckConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "CHECK constraint {name}"),
+            None => write!(f, "CHECK ({})", self.expr),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,8 +69,8 @@ impl ColumnDef {
     }
 
     pub fn default_value(&self) -> Option<&Expr> {
-        self.constraints.iter().find_map(|cc| match cc {
-            ColumnConstraint::Default(val) => Some(val),
+        self.constraints.iter().find_map(|c| match c {
+            ColumnConstraint::Default(expr) => Some(expr),
             _ => None,
         })
     }
@@ -63,6 +93,7 @@ pub enum ColumnConstraint {
     Unique,
     PrimaryKey,
     Default(Expr),
+    Check(CheckConstraint),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,16 +103,92 @@ pub struct DropTable {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub name: String,
+    pub if_exists: bool,
+    pub operation: AlterOperation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterOperation {
+    AddColumn {
+        column: ColumnDef,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    RenameTable {
+        name: String,
+    },
+    RenameColumn {
+        old: String,
+        new: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    pub name: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndex {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub distinct: bool,
     pub columns: Vec<SelectColumn>,
-    pub from: TableRef,
+    pub from: Option<TableRef>,
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Query {
+    Select(Box<Select>),
+    SetOperation(Box<SetOperation>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOperation {
+    pub op: SetOperator,
+    pub all: bool,
+    pub left: Query,
+    pub right: Query,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetOperator {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl fmt::Display for SetOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            SetOperator::Union => "UNION",
+            SetOperator::Intersect => "INTERSECT",
+            SetOperator::Except => "EXCEPT",
+        };
+        f.write_str(name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,7 +206,7 @@ pub struct Join {
     pub on: Option<Expr>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JoinType {
     Inner,
     Left,
@@ -109,7 +216,7 @@ pub enum JoinType {
 }
 
 impl fmt::Display for JoinType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             JoinType::Inner => "Inner",
             JoinType::Left => "Left",
@@ -124,7 +231,7 @@ impl fmt::Display for JoinType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectColumn {
     Wildcard,
-    QualifiedWildcard(String), // table.*
+    QualifiedWildcard(String),
     Column { table: Option<String>, name: String },
     Expr { expr: Expr, alias: Option<String> },
 }
@@ -147,6 +254,7 @@ pub struct Insert {
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     Select(Box<Select>),
+    SetOperation(Box<SetOperation>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +329,84 @@ pub enum Expr {
     },
 
     Nested(Box<Expr>),
+
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
+
+    Cast {
+        expr: Box<Expr>,
+        data_type: SqlDataType,
+    },
+
+    Subquery(Box<Query>),
+
+    Exists {
+        query: Box<Query>,
+        negated: bool,
+    },
+
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<Query>,
+        negated: bool,
+    },
+}
+
+impl Expr {
+    pub fn visit_columns_mut<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(&mut Option<String>, &mut String),
+    {
+        match self {
+            Expr::Column { table, name } => f(table, name),
+            Expr::Literal(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+            Expr::BinaryOp { left, right, .. } => {
+                left.visit_columns_mut(f);
+                right.visit_columns_mut(f);
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Like { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::InSubquery { expr, .. } => expr.visit_columns_mut(f),
+            Expr::InList { expr, list, .. } => {
+                expr.visit_columns_mut(f);
+                list.iter_mut().for_each(|e| e.visit_columns_mut(f));
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                expr.visit_columns_mut(f);
+                low.visit_columns_mut(f);
+                high.visit_columns_mut(f);
+            }
+            Expr::Function { args, .. } => {
+                if let FunctionArgs::List { args, .. } = args {
+                    args.iter_mut().for_each(|e| e.visit_columns_mut(f));
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_result,
+            } => {
+                if let Some(operand) = operand {
+                    operand.visit_columns_mut(f);
+                }
+                for (when, then) in branches {
+                    when.visit_columns_mut(f);
+                    then.visit_columns_mut(f);
+                }
+                if let Some(else_result) = else_result {
+                    else_result.visit_columns_mut(f);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -409,7 +595,181 @@ impl fmt::Display for Expr {
                 }
             },
             Expr::Nested(inner) => write!(f, "({inner})"),
+            Expr::Case {
+                operand,
+                branches,
+                else_result,
+            } => {
+                f.write_str("CASE")?;
+                if let Some(operand) = operand {
+                    write!(f, " {operand}")?;
+                }
+                for (condition, result) in branches {
+                    write!(f, " WHEN {condition} THEN {result}")?;
+                }
+                if let Some(otherwise) = else_result {
+                    write!(f, " ELSE {otherwise}")?;
+                }
+                f.write_str(" END")
+            }
+            Expr::Cast { expr, data_type } => write!(f, "CAST({expr} AS {data_type})"),
+            Expr::Subquery(query) => write!(f, "({query})"),
+            Expr::Exists { query, negated } => {
+                let not = if *negated { "NOT " } else { "" };
+                write!(f, "{not}EXISTS ({query})")
+            }
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => {
+                let not = if *negated { "NOT " } else { "" };
+                write!(f, "{expr} {not}IN ({query})")
+            }
         }
+    }
+}
+
+impl fmt::Display for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Query::Select(select) => write!(f, "{select}"),
+            Query::SetOperation(operation) => write!(f, "{operation}"),
+        }
+    }
+}
+
+fn write_order_limit(
+    f: &mut fmt::Formatter<'_>,
+    order_by: &[OrderBy],
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> fmt::Result {
+    for (i, key) in order_by.iter().enumerate() {
+        f.write_str(if i == 0 { " ORDER BY " } else { ", " })?;
+        write!(f, "{}", key.expr)?;
+        if !key.ascending {
+            f.write_str(" DESC")?;
+        }
+        match key.nulls_first {
+            Some(true) => f.write_str(" NULLS FIRST")?,
+            Some(false) => f.write_str(" NULLS LAST")?,
+            None => {}
+        }
+    }
+    if let Some(limit) = limit {
+        write!(f, " LIMIT {limit}")?;
+    }
+    if let Some(offset) = offset {
+        write!(f, " OFFSET {offset}")?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for SetOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let side = |f: &mut fmt::Formatter<'_>, query: &Query| match query {
+            Query::SetOperation(_) => write!(f, "({query})"),
+            Query::Select(select)
+                if !select.order_by.is_empty()
+                    || select.limit.is_some()
+                    || select.offset.is_some() =>
+            {
+                write!(f, "({query})")
+            }
+            Query::Select(_) => write!(f, "{query}"),
+        };
+        side(f, &self.left)?;
+        write!(f, " {}", self.op)?;
+        if self.all {
+            f.write_str(" ALL")?;
+        }
+        f.write_str(" ")?;
+        side(f, &self.right)?;
+        write_order_limit(f, &self.order_by, self.limit, self.offset)
+    }
+}
+
+impl fmt::Display for Select {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SELECT ")?;
+        if self.distinct {
+            f.write_str("DISTINCT ")?;
+        }
+        for (i, column) in self.columns.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match column {
+                SelectColumn::Wildcard => f.write_str("*")?,
+                SelectColumn::QualifiedWildcard(table) => write!(f, "{table}.*")?,
+                SelectColumn::Column {
+                    table: Some(table),
+                    name,
+                } => write!(f, "{table}.{name}")?,
+                SelectColumn::Column { table: None, name } => f.write_str(name)?,
+                SelectColumn::Expr { expr, alias } => {
+                    write!(f, "{expr}")?;
+                    if let Some(alias) = alias {
+                        write!(f, " AS {alias}")?;
+                    }
+                }
+            }
+        }
+        if let Some(from) = &self.from {
+            write!(f, " FROM {from}")?;
+        }
+        if let Some(predicate) = &self.where_clause {
+            write!(f, " WHERE {predicate}")?;
+        }
+        if !self.group_by.is_empty() {
+            f.write_str(" GROUP BY ")?;
+            write_list(f, &self.group_by)?;
+        }
+        if let Some(having) = &self.having {
+            write!(f, " HAVING {having}")?;
+        }
+        write_order_limit(f, &self.order_by, self.limit, self.offset)
+    }
+}
+
+impl fmt::Display for TableRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.base)?;
+        if let Some(alias) = &self.base_alias {
+            write!(f, " AS {alias}")?;
+        }
+        for join in &self.joins {
+            let keyword = match join.join_type {
+                JoinType::Inner => "JOIN",
+                JoinType::Left => "LEFT JOIN",
+                JoinType::Right => "RIGHT JOIN",
+                JoinType::Full => "FULL JOIN",
+                JoinType::Cross => "CROSS JOIN",
+            };
+            write!(f, " {keyword} {}", join.table)?;
+            if let Some(alias) = &join.alias {
+                write!(f, " AS {alias}")?;
+            }
+            if let Some(on) = &join.on {
+                write!(f, " ON {on}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for SqlDataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SqlDataType::Text => "TEXT",
+            SqlDataType::Integer => "INTEGER",
+            SqlDataType::Float => "FLOAT",
+            SqlDataType::Boolean => "BOOLEAN",
+            SqlDataType::Json => "JSON",
+            SqlDataType::Timestamp => "TIMESTAMP",
+            SqlDataType::Uuid => "UUID",
+        })
     }
 }
 
