@@ -3,6 +3,7 @@ pub mod binder;
 pub mod catalog;
 pub mod error;
 pub mod expr;
+pub mod formats;
 pub mod logical;
 pub mod optimizer;
 pub mod physical;
