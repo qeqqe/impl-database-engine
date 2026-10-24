@@ -105,6 +105,26 @@ fn push_down(plan: LogicalPlan, mut predicates: Vec<ScalarExpr>) -> PlanResult<L
                 predicates,
             ))
         }
+        LogicalPlan::SetOperation {
+            op,
+            all,
+            left,
+            right,
+            schema,
+        } => {
+            let left = push_down(*left, Vec::new())?;
+            let right = push_down(*right, Vec::new())?;
+            Ok(apply(
+                LogicalPlan::SetOperation {
+                    op,
+                    all,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    schema,
+                },
+                predicates,
+            ))
+        }
         leaf @ (LogicalPlan::Scan { .. } | LogicalPlan::Values { .. }) => {
             Ok(apply(leaf, predicates))
         }

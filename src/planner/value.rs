@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::planner::formats;
 use crate::sql::{BinaryOperator, LiteralValue, UnaryOperator};
 
 use super::types::DataType;
@@ -17,12 +18,15 @@ pub enum Value {
 
 pub type Row = Vec<Value>;
 
+const MAX_SHOWN: usize = 64;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalError {
     TypeMismatch(String),
     DivisionByZero,
     Overflow(String),
     InvalidCast { value: String, to: DataType },
+    InvalidArgument(String),
     ColumnOutOfRange { index: usize, width: usize },
 }
 
@@ -32,7 +36,11 @@ impl fmt::Display for EvalError {
             EvalError::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
             EvalError::DivisionByZero => f.write_str("division by zero"),
             EvalError::Overflow(msg) => write!(f, "numeric overflow: {msg}"),
-            EvalError::InvalidCast { value, to } => write!(f, "cannot cast {value} to {to}"),
+            EvalError::InvalidCast { value, to } => match value.char_indices().nth(MAX_SHOWN) {
+                Some((end, _)) => write!(f, "cannot cast {}... to {to}", &value[..end]),
+                None => write!(f, "cannot cast {value} to {to}"),
+            },
+            EvalError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             EvalError::ColumnOutOfRange { index, width } => {
                 write!(
                     f,
@@ -78,8 +86,8 @@ impl Value {
             (Value::Null, _) | (_, Value::Null) => Ok(None),
             (Value::Boolean(a), Value::Boolean(b)) => Ok(Some(a.cmp(b))),
             (Value::Integer(a), Value::Integer(b)) => Ok(Some(a.cmp(b))),
-            (Value::Integer(a), Value::Float(b)) => Ok(Some(cmp_f64(*a as f64, *b))),
-            (Value::Float(a), Value::Integer(b)) => Ok(Some(cmp_f64(*a, *b as f64))),
+            (Value::Integer(a), Value::Float(b)) => Ok(Some(cmp_int_f64(*a, *b))),
+            (Value::Float(a), Value::Integer(b)) => Ok(Some(cmp_int_f64(*b, *a).reverse())),
             (Value::Float(a), Value::Float(b)) => Ok(Some(cmp_f64(*a, *b))),
             (Value::Text(a), Value::Text(b)) => Ok(Some(a.cmp(b))),
             (a, b) => Err(EvalError::TypeMismatch(format!(
@@ -98,18 +106,27 @@ impl Value {
         match (self, to) {
             (Value::Null, _) => Ok(Value::Null),
             (Value::Boolean(b), DataType::Boolean) => Ok(Value::Boolean(*b)),
+            (Value::Boolean(b), DataType::Integer) => Ok(Value::Integer(i64::from(*b))),
+            (Value::Integer(i), DataType::Boolean) => Ok(Value::Boolean(*i != 0)),
             (Value::Integer(i), DataType::Integer) => Ok(Value::Integer(*i)),
             (Value::Integer(i), DataType::Float) => Ok(Value::Float(*i as f64)),
             (Value::Float(x), DataType::Float) => Ok(Value::Float(*x)),
             (Value::Float(x), DataType::Integer) => {
                 let rounded = x.round();
-                if rounded.is_finite() && rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64 {
+                if rounded.is_finite() && rounded >= i64::MIN as f64 && rounded < i64::MAX as f64 {
                     Ok(Value::Integer(rounded as i64))
                 } else {
                     Err(invalid())
                 }
             }
-            (Value::Text(s), t) if t.is_textual() => Ok(Value::Text(s.clone())),
+            (Value::Text(s), DataType::Json) if formats::is_json(s) => Ok(Value::Text(s.clone())),
+            (Value::Text(s), DataType::Timestamp) => formats::canonical_timestamp(s)
+                .map(Value::Text)
+                .ok_or_else(invalid),
+            (Value::Text(s), DataType::Uuid) => formats::canonical_uuid(s)
+                .map(Value::Text)
+                .ok_or_else(invalid),
+            (Value::Text(s), DataType::Text) => Ok(Value::Text(s.clone())),
             (Value::Text(s), DataType::Integer) => {
                 s.trim().parse().map(Value::Integer).map_err(|_| invalid())
             }
@@ -304,6 +321,18 @@ fn cmp_f64(a: f64, b: f64) -> Ordering {
         .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
 }
 
+fn cmp_int_f64(a: i64, b: f64) -> Ordering {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if b.is_nan() || b >= TWO_63 {
+        return Ordering::Less;
+    }
+    if b < -TWO_63 {
+        return Ordering::Greater;
+    }
+    let whole = b.trunc();
+    a.cmp(&(whole as i64)).then_with(|| cmp_f64(whole, b))
+}
+
 fn canonical_f64_bits(x: f64) -> u64 {
     if x == 0.0 {
         0
@@ -365,8 +394,10 @@ impl Ord for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
             (Value::Float(a), Value::Float(b)) => cmp_f64(*a, *b),
-            (Value::Integer(a), Value::Float(b)) => cmp_f64(*a as f64, *b).then(Ordering::Less),
-            (Value::Float(a), Value::Integer(b)) => cmp_f64(*a, *b as f64).then(Ordering::Greater),
+            (Value::Integer(a), Value::Float(b)) => cmp_int_f64(*a, *b).then(Ordering::Less),
+            (Value::Float(a), Value::Integer(b)) => {
+                cmp_int_f64(*b, *a).reverse().then(Ordering::Greater)
+            }
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (a, b) => a.rank().cmp(&b.rank()),
         }
@@ -418,6 +449,42 @@ impl From<String> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_and_float_compare_exactly() {
+        let two_53 = 1i64 << 53;
+        let cmp = |a: Value, b: Value| a.sql_cmp(&b).unwrap().unwrap();
+        assert_eq!(
+            cmp(Value::Integer(two_53 + 1), Value::Float(two_53 as f64)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp(Value::Float(two_53 as f64), Value::Integer(two_53 + 1)),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp(Value::Integer(two_53), Value::Float(two_53 as f64)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp(Value::Integer(i64::MAX), Value::Float(i64::MAX as f64)),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp(Value::Integer(i64::MIN), Value::Float(i64::MIN as f64)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp(Value::Integer(-3), Value::Float(-3.5)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp(Value::Integer(3), Value::Float(f64::NAN)),
+            Ordering::Less
+        );
+        assert!(Value::Integer(two_53 + 1) > Value::Float(two_53 as f64));
+        assert!(Value::Integer(two_53) < Value::Float(two_53 as f64));
+    }
 
     #[test]
     fn three_valued_and_or() {
@@ -504,6 +571,16 @@ mod tests {
     }
 
     #[test]
+    fn cast_errors_show_a_bounded_prefix_of_the_value() {
+        let long = Value::Text("é".repeat(10_000));
+        let err = long.cast(DataType::Integer).unwrap_err().to_string();
+        assert!(err.ends_with("... to INTEGER"), "{err}");
+        assert!(err.chars().count() < 100, "{err}");
+        let err = Value::Text("x".into()).cast(DataType::Integer).unwrap_err();
+        assert_eq!(err.to_string(), "cannot cast x to INTEGER");
+    }
+
+    #[test]
     fn cast_rules() {
         assert_eq!(
             Value::Integer(3).cast(DataType::Float).unwrap(),
@@ -515,5 +592,22 @@ mod tests {
         );
         assert!(Value::Text("x".into()).cast(DataType::Integer).is_err());
         assert!(Value::Null.cast(DataType::Integer).unwrap().is_null());
+        assert_eq!(
+            Value::Text("2024-01-02T03:04".into())
+                .cast(DataType::Timestamp)
+                .unwrap(),
+            Value::Text("2024-01-02 03:04:00".into())
+        );
+        assert!(
+            Value::Text("2024-02-30".into())
+                .cast(DataType::Timestamp)
+                .is_err()
+        );
+        assert!(Value::Text("nope".into()).cast(DataType::Uuid).is_err());
+        assert!(Value::Text("{bad".into()).cast(DataType::Json).is_err());
+        assert_eq!(
+            Value::Text("[1]".into()).cast(DataType::Json).unwrap(),
+            Value::Text("[1]".into())
+        );
     }
 }

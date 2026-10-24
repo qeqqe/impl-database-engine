@@ -146,6 +146,23 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<ColumnId>) -> PlanResult<Logical
             limit,
             offset,
         }),
+        LogicalPlan::SetOperation {
+            op,
+            all,
+            left,
+            right,
+            schema,
+        } => {
+            let left_all: BTreeSet<ColumnId> = left.schema().ids().collect();
+            let right_all: BTreeSet<ColumnId> = right.schema().ids().collect();
+            Ok(LogicalPlan::SetOperation {
+                op,
+                all,
+                left: Box::new(prune(*left, &left_all)?),
+                right: Box::new(prune(*right, &right_all)?),
+                schema,
+            })
+        }
     }
 }
 
