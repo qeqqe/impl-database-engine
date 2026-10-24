@@ -1,11 +1,97 @@
 use sqlparser::ast as sp;
 use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser as SqlParser;
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use super::ast::*;
 use super::error::{ParseError, ParseResult};
 
 pub struct Parser;
+
+pub const MAX_EXPR_DEPTH: usize = 1000;
+pub const MAX_SEGMENT_TOKENS: usize = 10 * MAX_EXPR_DEPTH;
+pub const MAX_COMPOUND_SELECT: usize = 500;
+pub const MAX_FROM_TABLES: usize = 64;
+
+fn parse_sql(sql: &str) -> ParseResult<Vec<sp::Statement>> {
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(sqlparser::parser::ParserError::from)?;
+    check_segment_lengths(&tokens)?;
+    Ok(SqlParser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()?)
+}
+
+fn check_segment_lengths(tokens: &[TokenWithSpan]) -> ParseResult<()> {
+    let mut levels = vec![0usize];
+    let mut set_operators = 0;
+    for token in tokens {
+        match &token.token {
+            Token::Whitespace(_) => continue,
+            Token::LParen => levels.push(0),
+            Token::Comma => *levels.last_mut().unwrap() = 0,
+            Token::SemiColon => {
+                levels = vec![0];
+                set_operators = 0;
+            }
+            Token::Word(word)
+                if matches!(
+                    word.keyword,
+                    Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT | Keyword::MINUS
+                ) =>
+            {
+                set_operators += 1;
+                if set_operators >= MAX_COMPOUND_SELECT {
+                    return Err(ParseError::UnsupportedStatement(format!(
+                        "more than {MAX_COMPOUND_SELECT} terms in a compound SELECT"
+                    )));
+                }
+                *levels.last_mut().unwrap() += 1;
+            }
+            Token::RParen => {
+                if levels.len() > 1 {
+                    levels.pop();
+                }
+                *levels.last_mut().unwrap() += 1;
+            }
+            _ => *levels.last_mut().unwrap() += 1,
+        }
+        if *levels.last().unwrap() > MAX_SEGMENT_TOKENS {
+            return Err(ParseError::UnsupportedExpression(format!(
+                "more than {MAX_SEGMENT_TOKENS} tokens in one expression without a comma"
+            )));
+        }
+    }
+    Ok(())
+}
+
+thread_local! {
+    static EXPR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct ExprDepth;
+
+impl ExprDepth {
+    fn enter() -> ParseResult<ExprDepth> {
+        let depth = EXPR_DEPTH.get() + 1;
+        if depth > MAX_EXPR_DEPTH {
+            return Err(ParseError::UnsupportedExpression(format!(
+                "expression is nested more than {MAX_EXPR_DEPTH} levels deep"
+            )));
+        }
+        EXPR_DEPTH.set(depth);
+        Ok(ExprDepth)
+    }
+}
+
+impl Drop for ExprDepth {
+    fn drop(&mut self) {
+        EXPR_DEPTH.set(EXPR_DEPTH.get() - 1);
+    }
+}
 
 impl Parser {
     pub fn parse(sql: &str) -> ParseResult<Statement> {
@@ -17,8 +103,8 @@ impl Parser {
         // special commands not supported by sqlparser
         let trimmed_sql = sql.trim_end_matches(';').trim();
         let upper = trimmed_sql.to_uppercase();
-        if upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION" {
-            return Ok(Statement::Begin);
+        if let Some(mode) = transaction_mode(&upper) {
+            return Ok(Statement::Begin(mode));
         }
         if upper == "COMMIT" {
             return Ok(Statement::Commit);
@@ -37,8 +123,7 @@ impl Parser {
             return Ok(Statement::Describe(table.to_string()));
         }
 
-        let dialect = GenericDialect {};
-        let statements = SqlParser::parse_sql(&dialect, sql)?;
+        let statements = parse_sql(sql)?;
 
         if statements.is_empty() {
             return Err(ParseError::EmptyQuery);
@@ -52,33 +137,94 @@ impl Parser {
 
     /// parse multiple SQL statements
     pub fn parse_multi(sql: &str) -> ParseResult<Vec<Statement>> {
-        let dialect = GenericDialect {};
-        let statements = SqlParser::parse_sql(&dialect, sql)?;
+        let statements = parse_sql(sql)?;
         statements.iter().map(Self::convert_statement).collect()
     }
 
     fn convert_statement(stmt: &sp::Statement) -> ParseResult<Statement> {
         match stmt {
             sp::Statement::CreateTable(create) => Self::convert_create_table(create),
+            sp::Statement::CreateIndex(create) => Self::convert_create_index(create),
+            sp::Statement::AlterTable(alter) => Self::convert_alter_table(alter),
             sp::Statement::Drop {
                 object_type,
                 names,
                 if_exists,
                 ..
             } => Self::convert_drop(object_type, names, *if_exists),
-            sp::Statement::Query(query) => Self::convert_query(query).map(Statement::Select),
+            sp::Statement::Query(query) => match Self::convert_query(query)? {
+                Query::Select(select) => Ok(Statement::Select(*select)),
+                Query::SetOperation(operation) => Ok(Statement::SetOperation(operation)),
+            },
             sp::Statement::Insert(insert) => Self::convert_insert(insert),
             sp::Statement::Update(update) => Self::convert_update(update),
             sp::Statement::Delete(delete) => Self::convert_delete(delete),
-            sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
-            sp::Statement::Commit { .. } => Ok(Statement::Commit),
-            sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
+            sp::Statement::StartTransaction {
+                modes,
+                modifier,
+                statements,
+                exception,
+                ..
+            } => {
+                if !modes.is_empty() || !statements.is_empty() || exception.is_some() {
+                    return Err(ParseError::UnsupportedStatement(stmt.to_string()));
+                }
+                match modifier {
+                    None | Some(sp::TransactionModifier::Deferred) => {
+                        Ok(Statement::Begin(TransactionMode::Deferred))
+                    }
+                    Some(
+                        sp::TransactionModifier::Immediate | sp::TransactionModifier::Exclusive,
+                    ) => Ok(Statement::Begin(TransactionMode::Immediate)),
+                    Some(_) => Err(ParseError::UnsupportedStatement(stmt.to_string())),
+                }
+            }
+            sp::Statement::Commit {
+                chain: false,
+                modifier: None,
+                ..
+            } => Ok(Statement::Commit),
+            sp::Statement::Rollback {
+                chain: false,
+                savepoint: None,
+            } => Ok(Statement::Rollback),
+            sp::Statement::Commit { .. } | sp::Statement::Rollback { .. } => {
+                Err(ParseError::UnsupportedStatement(format!(
+                    "{stmt} (savepoints and AND CHAIN are not supported)"
+                )))
+            }
             sp::Statement::ShowTables { .. } => Ok(Statement::ShowTables),
             sp::Statement::ExplainTable { table_name, .. } => {
                 let name = Self::extract_table_name(table_name)?;
                 Ok(Statement::Describe(name))
             }
-            other => Err(ParseError::UnsupportedStatement(format!("{:?}", other))),
+            sp::Statement::Explain {
+                describe_alias,
+                analyze,
+                verbose,
+                query_plan,
+                estimate,
+                statement,
+                format,
+                options,
+            } => {
+                if !matches!(describe_alias, sp::DescribeAlias::Explain)
+                    || *verbose
+                    || *query_plan
+                    || *estimate
+                    || format.is_some()
+                    || options.is_some()
+                {
+                    return Err(ParseError::UnsupportedStatement(
+                        "only EXPLAIN and EXPLAIN ANALYZE are supported".into(),
+                    ));
+                }
+                Ok(Statement::Explain {
+                    analyze: *analyze,
+                    statement: Box::new(Self::convert_statement(statement)?),
+                })
+            }
+            other => Err(ParseError::UnsupportedStatement(format!("{}", other))),
         }
     }
 
@@ -123,6 +269,7 @@ impl Parser {
             .map(|c| vec![c.name.clone()])
             .collect();
 
+        let mut checks = Vec::new();
         for constraint in &create.constraints {
             match constraint {
                 sp::TableConstraint::PrimaryKey(pk) => {
@@ -138,6 +285,9 @@ impl Parser {
                     if !unique_keys.contains(&key) {
                         unique_keys.push(key);
                     }
+                }
+                sp::TableConstraint::Check(check) => {
+                    checks.push(Self::convert_check(check, check.name.as_ref())?);
                 }
                 other => {
                     return Err(ParseError::UnsupportedStatement(format!(
@@ -166,8 +316,24 @@ impl Parser {
             columns,
             primary_key,
             unique_keys,
+            checks,
             if_not_exists: create.if_not_exists,
         }))
+    }
+
+    fn convert_check(
+        check: &sp::CheckConstraint,
+        name: Option<&sp::Ident>,
+    ) -> ParseResult<CheckConstraint> {
+        if check.no_inherit || check.enforced == Some(false) {
+            return Err(ParseError::UnsupportedStatement(format!(
+                "CHECK constraint form not supported: {check}"
+            )));
+        }
+        Ok(CheckConstraint {
+            name: name.map(|n| n.value.clone()),
+            expr: Self::convert_expr(&check.expr)?,
+        })
     }
 
     fn constraint_columns(
@@ -205,7 +371,31 @@ impl Parser {
     fn convert_column_def(col: &sp::ColumnDef) -> ParseResult<ColumnDef> {
         let data_type = Self::convert_data_type(&col.data_type)?;
         let mut constraints: Vec<ColumnConstraint> = Vec::new();
+        let count =
+            |f: fn(&sp::ColumnOption) -> bool| col.options.iter().filter(|o| f(&o.option)).count();
+        let conflict = if count(|o| matches!(o, sp::ColumnOption::PrimaryKey(..))) > 1 {
+            Some("multiple PRIMARY KEY declarations")
+        } else if count(|o| matches!(o, sp::ColumnOption::Default(..))) > 1 {
+            Some("multiple DEFAULT values")
+        } else if count(|o| matches!(o, sp::ColumnOption::Null)) > 0
+            && count(|o| matches!(o, sp::ColumnOption::NotNull)) > 0
+        {
+            Some("conflicting NULL and NOT NULL declarations")
+        } else {
+            None
+        };
+        if let Some(conflict) = conflict {
+            return Err(ParseError::UnsupportedStatement(format!(
+                "{conflict} for column {}",
+                col.name.value
+            )));
+        }
         for opt in &col.options {
+            if let sp::ColumnOption::Check(check) = &opt.option {
+                let name = opt.name.as_ref().or(check.name.as_ref());
+                constraints.push(ColumnConstraint::Check(Self::convert_check(check, name)?));
+                continue;
+            }
             if let Some(constraint) = Self::convert_column_option(&opt.option)?
                 && !constraints.contains(&constraint)
             {
@@ -252,7 +442,7 @@ impl Parser {
 
             sp::DataType::Uuid => Ok(SqlDataType::Uuid),
 
-            other => Err(ParseError::UnsupportedDataType(format!("{:?}", other))),
+            other => Err(ParseError::UnsupportedDataType(format!("{}", other))),
         }
     }
 
@@ -274,6 +464,145 @@ impl Parser {
         }
     }
 
+    fn convert_create_index(create: &sp::CreateIndex) -> ParseResult<Statement> {
+        let unsupported = |what: &str| {
+            Err(ParseError::UnsupportedStatement(format!(
+                "CREATE INDEX ... {what} not supported"
+            )))
+        };
+        if create.using.is_some() || !create.index_options.is_empty() {
+            return unsupported("USING");
+        }
+        if create.concurrently || create.r#async {
+            return unsupported("CONCURRENTLY");
+        }
+        if !create.include.is_empty() {
+            return unsupported("INCLUDE");
+        }
+        if create.nulls_distinct.is_some() {
+            return unsupported("NULLS DISTINCT");
+        }
+        if !create.with.is_empty() || !create.alter_options.is_empty() {
+            return unsupported("WITH");
+        }
+        if create.predicate.is_some() {
+            return unsupported("WHERE (partial indexes)");
+        }
+        let Some(name) = &create.name else {
+            return Err(ParseError::MissingClause("index name".into()));
+        };
+        let name = Self::extract_table_name(name)?;
+        let table = Self::extract_table_name(&create.table_name)?;
+        let columns = create
+            .columns
+            .iter()
+            .map(|c| {
+                let order = &c.column;
+                if c.operator_class.is_some()
+                    || order.with_fill.is_some()
+                    || order.options.nulls_first.is_some()
+                    || !matches!(order.options.sort, None | Some(sp::OrderBySort::Asc))
+                {
+                    return Err(ParseError::UnsupportedStatement(format!(
+                        "index column options not supported: {}",
+                        c.column
+                    )));
+                }
+                match &order.expr {
+                    sp::Expr::Identifier(ident) => Ok(ident.value.clone()),
+                    other => Err(ParseError::UnsupportedStatement(format!(
+                        "index on an expression not supported: {other}"
+                    ))),
+                }
+            })
+            .collect::<ParseResult<Vec<_>>>()?;
+        if columns.is_empty() {
+            return Err(ParseError::MissingClause("index columns".into()));
+        }
+        for (i, column) in columns.iter().enumerate() {
+            if columns[..i].iter().any(|c| c.eq_ignore_ascii_case(column)) {
+                return Err(ParseError::InvalidIdentifier(format!(
+                    "column {column} appears twice in index {name}"
+                )));
+            }
+        }
+        Ok(Statement::CreateIndex(CreateIndex {
+            name,
+            table,
+            columns,
+            unique: create.unique,
+            if_not_exists: create.if_not_exists,
+        }))
+    }
+
+    fn convert_alter_table(alter: &sp::AlterTable) -> ParseResult<Statement> {
+        if alter.only
+            || alter.location.is_some()
+            || alter.on_cluster.is_some()
+            || alter.table_type.is_some()
+        {
+            return Err(ParseError::UnsupportedStatement(format!(
+                "ALTER TABLE form not supported: {alter}"
+            )));
+        }
+        let [operation] = alter.operations.as_slice() else {
+            return Err(ParseError::UnsupportedStatement(
+                "ALTER TABLE takes exactly one operation, use one statement per change".into(),
+            ));
+        };
+        let operation = match operation {
+            sp::AlterTableOperation::AddColumn {
+                if_not_exists,
+                column_def,
+                column_position: None,
+                ..
+            } => AlterOperation::AddColumn {
+                column: Self::convert_column_def(column_def)?,
+                if_not_exists: *if_not_exists,
+            },
+            sp::AlterTableOperation::DropColumn {
+                column_names,
+                if_exists,
+                drop_behavior: None,
+                ..
+            } => {
+                let [name] = column_names.as_slice() else {
+                    return Err(ParseError::UnsupportedStatement(
+                        "ALTER TABLE DROP COLUMN takes one column".into(),
+                    ));
+                };
+                AlterOperation::DropColumn {
+                    name: name.value.clone(),
+                    if_exists: *if_exists,
+                }
+            }
+            sp::AlterTableOperation::RenameTable { table_name } => {
+                let (sp::RenameTableNameKind::To(name) | sp::RenameTableNameKind::As(name)) =
+                    table_name;
+                AlterOperation::RenameTable {
+                    name: Self::extract_table_name(name)?,
+                }
+            }
+            sp::AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => AlterOperation::RenameColumn {
+                old: old_column_name.value.clone(),
+                new: new_column_name.value.clone(),
+            },
+            other => {
+                return Err(ParseError::UnsupportedStatement(format!(
+                    "ALTER TABLE operation not supported: {other}"
+                )));
+            }
+        };
+        Ok(Statement::AlterTable(AlterTable {
+            name: Self::extract_table_name(&alter.name)?,
+            if_exists: alter.if_exists,
+            operation,
+        }))
+    }
+
     fn convert_drop(
         object_type: &sp::ObjectType,
         names: &[sp::ObjectName],
@@ -289,14 +618,23 @@ impl Parser {
                 let name = Self::extract_table_name(&names[0])?;
                 Ok(Statement::DropTable(DropTable { name, if_exists }))
             }
+            sp::ObjectType::Index => {
+                if names.len() != 1 {
+                    return Err(ParseError::UnsupportedStatement(
+                        "DROP multiple indexes not supported".into(),
+                    ));
+                }
+                let name = Self::extract_table_name(&names[0])?;
+                Ok(Statement::DropIndex(DropIndex { name, if_exists }))
+            }
             other => Err(ParseError::UnsupportedStatement(format!(
-                "DROP {:?} not supported",
+                "DROP {} not supported",
                 other
             ))),
         }
     }
 
-    fn convert_query(query: &sp::Query) -> ParseResult<Select> {
+    fn convert_query(query: &sp::Query) -> ParseResult<Query> {
         if query.with.is_some() {
             return Err(ParseError::UnsupportedStatement(
                 "WITH (common table expressions) not supported".into(),
@@ -313,16 +651,88 @@ impl Parser {
             ));
         }
 
-        let select = match query.body.as_ref() {
-            sp::SetExpr::Select(s) => s,
-            other => {
-                return Err(ParseError::UnsupportedStatement(format!(
-                    "Unsupported query type: {}",
-                    other
-                )));
+        let body = Self::convert_set_expr(query.body.as_ref())?;
+        let (order_by, limit, offset) = Self::convert_order_limit(query)?;
+        if order_by.is_empty() && limit.is_none() && offset.is_none() {
+            return Ok(body);
+        }
+        match body {
+            Query::Select(mut select)
+                if select.order_by.is_empty()
+                    && select.limit.is_none()
+                    && select.offset.is_none() =>
+            {
+                select.order_by = order_by;
+                select.limit = limit;
+                select.offset = offset;
+                Ok(Query::Select(select))
             }
-        };
+            Query::SetOperation(mut operation)
+                if operation.order_by.is_empty()
+                    && operation.limit.is_none()
+                    && operation.offset.is_none() =>
+            {
+                operation.order_by = order_by;
+                operation.limit = limit;
+                operation.offset = offset;
+                Ok(Query::SetOperation(operation))
+            }
+            _ => Err(ParseError::UnsupportedStatement(
+                "ORDER BY / LIMIT around a parenthesized query that has its own is not supported"
+                    .into(),
+            )),
+        }
+    }
 
+    fn convert_set_expr(body: &sp::SetExpr) -> ParseResult<Query> {
+        match body {
+            sp::SetExpr::Select(select) => {
+                Ok(Query::Select(Box::new(Self::convert_select(select)?)))
+            }
+            sp::SetExpr::Query(query) => Self::convert_query(query),
+            sp::SetExpr::SetOperation {
+                left,
+                op,
+                set_quantifier,
+                right,
+            } => {
+                let op = match op {
+                    sp::SetOperator::Union => SetOperator::Union,
+                    sp::SetOperator::Intersect => SetOperator::Intersect,
+                    sp::SetOperator::Except => SetOperator::Except,
+                    sp::SetOperator::Minus => {
+                        return Err(ParseError::UnsupportedStatement(
+                            "MINUS not supported; use EXCEPT".into(),
+                        ));
+                    }
+                };
+                let all = match set_quantifier {
+                    sp::SetQuantifier::All => true,
+                    sp::SetQuantifier::Distinct | sp::SetQuantifier::None => false,
+                    other => {
+                        return Err(ParseError::UnsupportedStatement(format!(
+                            "{op} {other} not supported"
+                        )));
+                    }
+                };
+                Ok(Query::SetOperation(Box::new(SetOperation {
+                    op,
+                    all,
+                    left: Self::convert_set_expr(left)?,
+                    right: Self::convert_set_expr(right)?,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                })))
+            }
+            other => Err(ParseError::UnsupportedStatement(format!(
+                "Unsupported query type: {}",
+                other
+            ))),
+        }
+    }
+
+    fn convert_select(select: &sp::Select) -> ParseResult<Select> {
         Self::reject_unsupported_select_clauses(select)?;
 
         let distinct = match &select.distinct {
@@ -370,6 +780,22 @@ impl Parser {
         // HAVING
         let having = select.having.as_ref().map(Self::convert_expr).transpose()?;
 
+        Ok(Select {
+            distinct,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        })
+    }
+
+    fn convert_order_limit(
+        query: &sp::Query,
+    ) -> ParseResult<(Vec<OrderBy>, Option<usize>, Option<usize>)> {
         let order_by = query
             .order_by
             .as_ref()
@@ -406,17 +832,7 @@ impl Parser {
             None => (None, None),
         };
 
-        Ok(Select {
-            distinct,
-            columns,
-            from,
-            where_clause,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-        })
+        Ok((order_by, limit, offset))
     }
 
     fn reject_unsupported_select_clauses(select: &sp::Select) -> ParseResult<()> {
@@ -442,9 +858,9 @@ impl Parser {
         }
     }
 
-    fn convert_from(from: &[sp::TableWithJoins]) -> ParseResult<TableRef> {
+    fn convert_from(from: &[sp::TableWithJoins]) -> ParseResult<Option<TableRef>> {
         let Some((first, rest)) = from.split_first() else {
-            return Err(ParseError::MissingClause("FROM".into()));
+            return Ok(None);
         };
 
         let mut table_ref = Self::extract_table_ref(first)?;
@@ -460,7 +876,12 @@ impl Parser {
                 table_ref.joins.push(Self::convert_join(join)?);
             }
         }
-        Ok(table_ref)
+        if table_ref.joins.len() >= MAX_FROM_TABLES {
+            return Err(ParseError::UnsupportedStatement(format!(
+                "more than {MAX_FROM_TABLES} tables in one FROM clause"
+            )));
+        }
+        Ok(Some(table_ref))
     }
 
     fn convert_projection(items: &[sp::SelectItem]) -> ParseResult<Vec<SelectColumn>> {
@@ -479,8 +900,8 @@ impl Parser {
                             name: col.value.clone(),
                         }),
                         _ => Err(ParseError::UnsupportedExpression(format!(
-                            "Unsupported identifier depth: {:?}",
-                            parts
+                            "Unsupported identifier depth: {}",
+                            sp::ObjectName::from(parts.clone())
                         ))),
                     },
                     _ => {
@@ -620,7 +1041,10 @@ impl Parser {
                     .collect::<ParseResult<Vec<_>>>()?;
                 InsertSource::Values(rows)
             }
-            _ => InsertSource::Select(Box::new(Self::convert_query(query)?)),
+            _ => match Self::convert_query(query)? {
+                Query::Select(select) => InsertSource::Select(select),
+                Query::SetOperation(operation) => InsertSource::SetOperation(operation),
+            },
         };
 
         Ok(Statement::Insert(Insert {
@@ -752,6 +1176,11 @@ impl Parser {
     }
 
     fn convert_expr(expr: &sp::Expr) -> ParseResult<Expr> {
+        let _depth = ExprDepth::enter()?;
+        Self::convert_expr_at_depth(expr)
+    }
+
+    fn convert_expr_at_depth(expr: &sp::Expr) -> ParseResult<Expr> {
         match expr {
             sp::Expr::Identifier(id) => Ok(Expr::Column {
                 table: None,
@@ -764,8 +1193,8 @@ impl Parser {
                     name: col.value.clone(),
                 }),
                 _ => Err(ParseError::UnsupportedExpression(format!(
-                    "Unsupported identifier depth: {:?}",
-                    parts
+                    "Unsupported identifier depth: {}",
+                    sp::ObjectName::from(parts.clone())
                 ))),
             },
 
@@ -783,6 +1212,13 @@ impl Parser {
             }
 
             sp::Expr::UnaryOp { op, expr } => {
+                if let (sp::UnaryOperator::Minus, sp::Expr::Value(v)) = (op, expr.as_ref())
+                    && let sp::Value::Number(s, _) = &v.value
+                    && s.parse::<i64>().is_err()
+                    && let Ok(i) = format!("-{s}").parse::<i64>()
+                {
+                    return Ok(Expr::Literal(LiteralValue::Integer(i)));
+                }
                 let e = Self::convert_expr(expr)?;
                 let o = Self::convert_unary_op(op)?;
                 Ok(Expr::UnaryOp {
@@ -864,7 +1300,95 @@ impl Parser {
                 Ok(Expr::Nested(Box::new(e)))
             }
 
-            other => Err(ParseError::UnsupportedExpression(format!("{:?}", other))),
+            sp::Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => Ok(Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Self::convert_expr(e).map(Box::new))
+                    .transpose()?,
+                branches: conditions
+                    .iter()
+                    .map(|w| {
+                        Ok((
+                            Self::convert_expr(&w.condition)?,
+                            Self::convert_expr(&w.result)?,
+                        ))
+                    })
+                    .collect::<ParseResult<Vec<_>>>()?,
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Self::convert_expr(e).map(Box::new))
+                    .transpose()?,
+            }),
+
+            sp::Expr::Cast {
+                kind,
+                expr,
+                data_type,
+                format,
+            } => {
+                if !matches!(kind, sp::CastKind::Cast | sp::CastKind::DoubleColon) {
+                    return Err(ParseError::UnsupportedExpression(
+                        "TRY_CAST / SAFE_CAST not supported".into(),
+                    ));
+                }
+                if format.is_some() {
+                    return Err(ParseError::UnsupportedExpression(
+                        "CAST ... FORMAT not supported".into(),
+                    ));
+                }
+                Ok(Expr::Cast {
+                    expr: Box::new(Self::convert_expr(expr)?),
+                    data_type: Self::convert_data_type(data_type)?,
+                })
+            }
+
+            sp::Expr::Subquery(query) => Ok(Expr::Subquery(Box::new(Self::convert_query(query)?))),
+
+            sp::Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+                query: Box::new(Self::convert_query(subquery)?),
+                negated: *negated,
+            }),
+
+            sp::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Ok(Expr::InSubquery {
+                expr: Box::new(Self::convert_expr(expr)?),
+                query: Box::new(Self::convert_query(subquery)?),
+                negated: *negated,
+            }),
+
+            sp::Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let mut args = vec![Self::convert_expr(expr)?];
+                match (substring_from, substring_for) {
+                    (Some(from), _) => args.push(Self::convert_expr(from)?),
+                    (None, Some(_)) => args.push(Expr::Literal(LiteralValue::Integer(1))),
+                    (None, None) => {}
+                }
+                if let Some(length) = substring_for {
+                    args.push(Self::convert_expr(length)?);
+                }
+                Ok(Expr::Function {
+                    name: "SUBSTR".into(),
+                    args: FunctionArgs::List {
+                        args,
+                        distinct: false,
+                    },
+                })
+            }
+
+            other => Err(ParseError::UnsupportedExpression(format!("{}", other))),
         }
     }
 
@@ -981,7 +1505,7 @@ impl Parser {
             sp::Value::SingleQuotedString(s) => Ok(LiteralValue::String(s.clone())),
             sp::Value::DoubleQuotedString(s) => Ok(LiteralValue::String(s.clone())),
             other => Err(ParseError::UnsupportedExpression(format!(
-                "Unsupported value: {:?}",
+                "Unsupported value: {}",
                 other
             ))),
         }
@@ -1017,7 +1541,7 @@ impl Parser {
             sp::BinaryOperator::Modulo => Ok(BinaryOperator::Modulo),
             sp::BinaryOperator::StringConcat => Ok(BinaryOperator::Concat),
             other => Err(ParseError::UnsupportedExpression(format!(
-                "Unsupported operator: {:?}",
+                "Unsupported operator: {}",
                 other
             ))),
         }
@@ -1029,7 +1553,7 @@ impl Parser {
             sp::UnaryOperator::Minus => Ok(UnaryOperator::Minus),
             sp::UnaryOperator::Plus => Ok(UnaryOperator::Plus),
             other => Err(ParseError::UnsupportedExpression(format!(
-                "Unsupported unary operator: {:?}",
+                "Unsupported unary operator: {}",
                 other
             ))),
         }
@@ -1176,9 +1700,197 @@ impl Parser {
     }
 }
 
+fn transaction_mode(upper: &str) -> Option<TransactionMode> {
+    if upper == "START TRANSACTION" {
+        return Some(TransactionMode::Deferred);
+    }
+    let mut words = upper.split_whitespace();
+    if words.next() != Some("BEGIN") {
+        return None;
+    }
+    let mut rest: Vec<&str> = words.collect();
+    if rest.last() == Some(&"TRANSACTION") {
+        rest.pop();
+    }
+    match rest.as_slice() {
+        [] | ["DEFERRED"] => Some(TransactionMode::Deferred),
+        ["IMMEDIATE"] | ["EXCLUSIVE"] => Some(TransactionMode::Immediate),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_begin_modes() {
+        let cases = [
+            ("BEGIN", TransactionMode::Deferred),
+            ("begin transaction;", TransactionMode::Deferred),
+            ("START TRANSACTION", TransactionMode::Deferred),
+            ("BEGIN DEFERRED", TransactionMode::Deferred),
+            ("BEGIN IMMEDIATE", TransactionMode::Immediate),
+            ("begin immediate transaction", TransactionMode::Immediate),
+            ("BEGIN EXCLUSIVE;", TransactionMode::Immediate),
+        ];
+        for (sql, mode) in cases {
+            assert_eq!(Parser::parse(sql).unwrap(), Statement::Begin(mode), "{sql}");
+        }
+        assert!(Parser::parse("BEGIN SOMETIMES").is_err());
+        assert!(Parser::parse("BEGIN IMMEDIATE DEFERRED").is_err());
+        let script = Parser::parse_multi(
+            "BEGIN IMMEDIATE; COMMIT; BEGIN EXCLUSIVE TRANSACTION; COMMIT; BEGIN; COMMIT; START TRANSACTION; COMMIT",
+        )
+        .unwrap();
+        let begins: Vec<_> = script
+            .iter()
+            .filter_map(|s| match s {
+                Statement::Begin(mode) => Some(*mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            begins,
+            [
+                TransactionMode::Immediate,
+                TransactionMode::Immediate,
+                TransactionMode::Deferred,
+                TransactionMode::Deferred
+            ]
+        );
+        assert!(Parser::parse_multi("START TRANSACTION ISOLATION LEVEL READ COMMITTED").is_err());
+    }
+
+    #[test]
+    fn test_commit_and_rollback_variants() {
+        for sql in [
+            "COMMIT",
+            "commit;",
+            "COMMIT TRANSACTION",
+            "COMMIT WORK",
+            "END",
+        ] {
+            assert_eq!(Parser::parse(sql).unwrap(), Statement::Commit, "{sql}");
+        }
+        for sql in [
+            "ROLLBACK",
+            "rollback;",
+            "ROLLBACK TRANSACTION",
+            "ROLLBACK WORK",
+        ] {
+            assert_eq!(Parser::parse(sql).unwrap(), Statement::Rollback, "{sql}");
+        }
+        for sql in [
+            "ROLLBACK TO s",
+            "ROLLBACK TO SAVEPOINT s",
+            "ROLLBACK TRANSACTION TO SAVEPOINT s",
+            "ROLLBACK AND CHAIN",
+            "COMMIT AND CHAIN",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+        ] {
+            let err = Parser::parse(sql).unwrap_err().to_string();
+            assert!(
+                err.contains("not supported") || err.contains("Unsupported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conflicting_column_options_are_rejected() {
+        for (sql, message) in [
+            (
+                "CREATE TABLE t (a INT PRIMARY KEY PRIMARY KEY)",
+                "multiple PRIMARY KEY",
+            ),
+            (
+                "CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)",
+                "multiple DEFAULT",
+            ),
+            (
+                "CREATE TABLE t (a INT NOT NULL NULL)",
+                "conflicting NULL and NOT NULL",
+            ),
+            (
+                "CREATE TABLE t (a INT NULL NOT NULL)",
+                "conflicting NULL and NOT NULL",
+            ),
+        ] {
+            let err = Parser::parse(sql).unwrap_err().to_string();
+            assert!(err.contains(message), "{sql}: {err}");
+        }
+        for sql in [
+            "CREATE TABLE t (a INT NULL NULL)",
+            "CREATE TABLE t (a INT NOT NULL NOT NULL UNIQUE UNIQUE)",
+        ] {
+            assert!(Parser::parse(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_unsupported_input_is_reported_as_sql() {
+        for (sql, message) in [
+            (
+                "SELECT TRIM('  a ')",
+                "Unsupported expression: TRIM('  a ')",
+            ),
+            (
+                "SELECT 1 IS DISTINCT FROM 2",
+                "Unsupported expression: 1 IS DISTINCT FROM 2",
+            ),
+            ("SELECT a.b.c FROM t", "a.b.c"),
+        ] {
+            let err = Parser::parse(sql).unwrap_err().to_string();
+            assert!(err.contains(message), "{sql}: {err}");
+            assert!(!err.contains("Span"), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_size_limits_are_reported_as_errors() {
+        let terms = |n: usize| vec!["SELECT 1"; n].join(" UNION ALL ");
+        assert!(Parser::parse(&terms(MAX_COMPOUND_SELECT)).is_ok());
+        let err = Parser::parse(&terms(MAX_COMPOUND_SELECT + 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("terms in a compound SELECT"),
+            "{err}"
+        );
+
+        let tables = |n: usize| {
+            let list: Vec<String> = (0..n).map(|i| format!("t AS t{i}")).collect();
+            format!("SELECT 1 FROM {}", list.join(", "))
+        };
+        assert!(Parser::parse(&tables(MAX_FROM_TABLES)).is_ok());
+        let err = Parser::parse(&tables(MAX_FROM_TABLES + 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("tables in one FROM clause"),
+            "{err}"
+        );
+        let joins: String = (1..=MAX_FROM_TABLES)
+            .map(|i| format!(" JOIN t AS t{i} ON TRUE"))
+            .collect();
+        let err = Parser::parse(&format!("SELECT 1 FROM t AS t0{joins}")).unwrap_err();
+        assert!(
+            err.to_string().contains("tables in one FROM clause"),
+            "{err}"
+        );
+
+        let chain = |n: usize| format!("SELECT {}", vec!["1"; n].join("+"));
+        assert!(Parser::parse(&chain(MAX_EXPR_DEPTH)).is_ok());
+        let err = Parser::parse(&chain(MAX_EXPR_DEPTH + 1)).unwrap_err();
+        assert!(err.to_string().contains("nested more than"), "{err}");
+
+        let parens = |n: usize| format!("SELECT {}1{}", "(".repeat(n), ")".repeat(n));
+        assert!(Parser::parse(&parens(40)).is_ok());
+        let err = Parser::parse(&parens(100)).unwrap_err();
+        assert!(err.to_string().contains("nested too deeply"), "{err}");
+
+        let long = format!("SELECT {}", vec!["1"; MAX_SEGMENT_TOKENS].join("+"));
+        let err = Parser::parse(&long).unwrap_err();
+        assert!(err.to_string().contains("without a comma"), "{err}");
+    }
 
     #[test]
     fn test_parse_create_table() {
@@ -1505,10 +2217,10 @@ mod tests {
         let stmt = Parser::parse(sql).unwrap();
         match stmt {
             Statement::Select(s) => {
-                assert_eq!(s.from.base, "a");
-                assert!(s.from.base_alias.is_none());
-                assert_eq!(s.from.joins.len(), 1);
-                let j = &s.from.joins[0];
+                assert_eq!(s.from.as_ref().unwrap().base, "a");
+                assert!(s.from.as_ref().unwrap().base_alias.is_none());
+                assert_eq!(s.from.as_ref().unwrap().joins.len(), 1);
+                let j = &s.from.as_ref().unwrap().joins[0];
                 assert_eq!(j.table, "b");
                 assert_eq!(j.join_type, JoinType::Inner);
                 match j.on.as_ref().unwrap() {
@@ -1542,8 +2254,8 @@ mod tests {
         let stmt = Parser::parse(sql).unwrap();
         match stmt {
             Statement::Select(s) => {
-                assert_eq!(s.from.joins.len(), 1);
-                assert_eq!(s.from.joins[0].join_type, JoinType::Left);
+                assert_eq!(s.from.as_ref().unwrap().joins.len(), 1);
+                assert_eq!(s.from.as_ref().unwrap().joins[0].join_type, JoinType::Left);
             }
             _ => panic!("Expected Select"),
         }
@@ -1553,15 +2265,15 @@ mod tests {
     fn test_multiple_joins() {
         let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id";
         let stmt = Parser::parse(sql).unwrap();
-
+        println!("{:#?}", stmt);
         match stmt {
             Statement::Select(s) => {
-                assert_eq!(s.from.base, "a");
-                assert_eq!(s.from.joins.len(), 2);
-                assert_eq!(s.from.joins[0].table, "b");
-                assert_eq!(s.from.joins[0].join_type, JoinType::Inner);
-                assert_eq!(s.from.joins[1].table, "c");
-                assert_eq!(s.from.joins[1].join_type, JoinType::Left);
+                assert_eq!(s.from.as_ref().unwrap().base, "a");
+                assert_eq!(s.from.as_ref().unwrap().joins.len(), 2);
+                assert_eq!(s.from.as_ref().unwrap().joins[0].table, "b");
+                assert_eq!(s.from.as_ref().unwrap().joins[0].join_type, JoinType::Inner);
+                assert_eq!(s.from.as_ref().unwrap().joins[1].table, "c");
+                assert_eq!(s.from.as_ref().unwrap().joins[1].join_type, JoinType::Left);
             }
             _ => panic!("Expected Select"),
         }
@@ -1573,8 +2285,8 @@ mod tests {
         let stmt = Parser::parse(sql).unwrap();
         match stmt {
             Statement::Select(s) => {
-                assert_eq!(s.from.base, "users");
-                assert_eq!(s.from.base_alias.as_deref(), Some("u"));
+                assert_eq!(s.from.as_ref().unwrap().base, "users");
+                assert_eq!(s.from.as_ref().unwrap().base_alias.as_deref(), Some("u"));
                 assert_eq!(
                     s.columns[0],
                     SelectColumn::Column {
@@ -1593,8 +2305,11 @@ mod tests {
         let stmt = Parser::parse(sql).unwrap();
         match stmt {
             Statement::Select(s) => {
-                assert_eq!(s.from.joins[0].table, "b");
-                assert_eq!(s.from.joins[0].alias.as_deref(), Some("bb"));
+                assert_eq!(s.from.as_ref().unwrap().joins[0].table, "b");
+                assert_eq!(
+                    s.from.as_ref().unwrap().joins[0].alias.as_deref(),
+                    Some("bb")
+                );
             }
             _ => panic!("Expected Select"),
         }
@@ -1606,9 +2321,9 @@ mod tests {
         let stmt = Parser::parse(sql).unwrap();
         match stmt {
             Statement::Select(s) => {
-                assert_eq!(s.from.joins.len(), 1);
-                assert_eq!(s.from.joins[0].join_type, JoinType::Cross);
-                assert!(s.from.joins[0].on.is_none());
+                assert_eq!(s.from.as_ref().unwrap().joins.len(), 1);
+                assert_eq!(s.from.as_ref().unwrap().joins[0].join_type, JoinType::Cross);
+                assert!(s.from.as_ref().unwrap().joins[0].on.is_none());
             }
             _ => panic!("Expected Select"),
         }
@@ -1750,6 +2465,7 @@ mod tests {
     fn test_full_integration_query() {
         let sql = "SELECT a.id, b.name FROM a JOIN b ON a.id = b.a_id WHERE a.age >= 18 GROUP BY b.name HAVING COUNT(*) > 1";
         let stmt = Parser::parse(sql).unwrap();
+        println!("{:#?}", stmt);
         match stmt {
             Statement::Select(s) => {
                 assert_eq!(
@@ -1767,12 +2483,12 @@ mod tests {
                     }
                 );
 
-                assert_eq!(s.from.base, "a");
-                assert_eq!(s.from.joins.len(), 1);
-                assert_eq!(s.from.joins[0].table, "b");
-                assert_eq!(s.from.joins[0].join_type, JoinType::Inner);
+                assert_eq!(s.from.as_ref().unwrap().base, "a");
+                assert_eq!(s.from.as_ref().unwrap().joins.len(), 1);
+                assert_eq!(s.from.as_ref().unwrap().joins[0].table, "b");
+                assert_eq!(s.from.as_ref().unwrap().joins[0].join_type, JoinType::Inner);
 
-                match s.from.joins[0].on.as_ref().unwrap() {
+                match s.from.as_ref().unwrap().joins[0].on.as_ref().unwrap() {
                     Expr::BinaryOp { left, op, right } => {
                         assert_eq!(
                             **left,
@@ -1933,24 +2649,246 @@ mod tests {
     #[test]
     fn test_comma_join_becomes_cross_join() {
         let s = select("SELECT * FROM a, b AS bb JOIN c ON bb.id = c.id");
-        assert_eq!(s.from.base, "a");
-        assert_eq!(s.from.joins.len(), 2);
-        assert_eq!(s.from.joins[0].join_type, JoinType::Cross);
-        assert_eq!(s.from.joins[0].alias.as_deref(), Some("bb"));
-        assert_eq!(s.from.joins[1].join_type, JoinType::Inner);
+        assert_eq!(s.from.as_ref().unwrap().base, "a");
+        assert_eq!(s.from.as_ref().unwrap().joins.len(), 2);
+        assert_eq!(s.from.as_ref().unwrap().joins[0].join_type, JoinType::Cross);
+        assert_eq!(
+            s.from.as_ref().unwrap().joins[0].alias.as_deref(),
+            Some("bb")
+        );
+        assert_eq!(s.from.as_ref().unwrap().joins[1].join_type, JoinType::Inner);
     }
 
     #[test]
-    fn test_cte_and_set_operations_rejected() {
+    fn test_cte_rejected() {
         assert!(unsupported("WITH x AS (SELECT 1) SELECT * FROM x").contains("WITH"));
-        assert!(Parser::parse("SELECT a FROM t UNION SELECT a FROM u").is_err());
+    }
+
+    fn set_operation(sql: &str) -> SetOperation {
+        match Parser::parse(sql).unwrap() {
+            Statement::SetOperation(s) => *s,
+            other => panic!("Expected SetOperation, got {:?}", other),
+        }
+    }
+
+    fn leaf_table(query: &Query) -> &str {
+        match query {
+            Query::Select(s) => &s.from.as_ref().unwrap().base,
+            Query::SetOperation(s) => panic!("Expected a SELECT, got {s:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_operations_intersect_binds_tighter() {
+        let top = set_operation(
+            "SELECT a FROM t UNION ALL SELECT a FROM u INTERSECT SELECT a FROM v ORDER BY a DESC LIMIT 3 OFFSET 1",
+        );
+        assert_eq!(top.op, SetOperator::Union);
+        assert!(top.all);
+        assert_eq!(leaf_table(&top.left), "t");
+        assert_eq!(top.order_by.len(), 1);
+        assert!(!top.order_by[0].ascending);
+        assert_eq!((top.limit, top.offset), (Some(3), Some(1)));
+        let Query::SetOperation(right) = &top.right else {
+            panic!("{:?}", top.right)
+        };
+        assert_eq!(right.op, SetOperator::Intersect);
+        assert!(!right.all);
+        assert_eq!(leaf_table(&right.left), "u");
+        assert_eq!(leaf_table(&right.right), "v");
+
+        let chain = set_operation("SELECT a FROM t EXCEPT SELECT a FROM u EXCEPT SELECT a FROM v");
+        let Query::SetOperation(left) = &chain.left else {
+            panic!("{:?}", chain.left)
+        };
+        assert_eq!(leaf_table(&left.left), "t");
+        assert_eq!(leaf_table(&chain.right), "v");
+        assert!(
+            set_operation("SELECT a FROM t UNION DISTINCT SELECT a FROM u")
+                .order_by
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_subquery_expressions() {
+        let s = select(
+            "SELECT (SELECT MAX(a) FROM t) FROM u WHERE b NOT IN (SELECT a FROM t UNION SELECT 1) AND NOT EXISTS (SELECT * FROM v)",
+        );
+        let SelectColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!("{:?}", s.columns[0])
+        };
+        let Expr::Subquery(scalar) = expr else {
+            panic!("{expr:?}")
+        };
+        assert_eq!(leaf_table(scalar), "t");
+        let Some(Expr::BinaryOp { left, right, .. }) = &s.where_clause else {
+            panic!("{:?}", s.where_clause)
+        };
+        assert!(matches!(
+            left.as_ref(),
+            Expr::InSubquery { negated: true, query, .. } if matches!(query.as_ref(), Query::SetOperation(_))
+        ));
+        assert!(matches!(right.as_ref(), Expr::Exists { negated: true, .. }));
+    }
+
+    #[test]
+    fn test_queries_display_as_sql() {
+        for sql in [
+            "SELECT DISTINCT t.a, b AS c, * FROM t AS x LEFT JOIN u ON x.a = u.a WHERE a > 1 GROUP BY a HAVING COUNT(*) > 1 ORDER BY a DESC NULLS LAST LIMIT 3 OFFSET 2",
+            "SELECT a FROM t UNION ALL (SELECT a FROM u INTERSECT SELECT a FROM v) ORDER BY 1",
+            "(SELECT a FROM t LIMIT 1) EXCEPT SELECT a FROM u",
+            "SELECT x.* FROM t AS x CROSS JOIN u",
+        ] {
+            let query = match Parser::parse(sql).unwrap() {
+                Statement::Select(s) => Query::Select(Box::new(s)),
+                Statement::SetOperation(s) => Query::SetOperation(s),
+                other => panic!("{other:?}"),
+            };
+            let text = query.to_string();
+            let again = match Parser::parse(&text).unwrap() {
+                Statement::Select(s) => Query::Select(Box::new(s)),
+                Statement::SetOperation(s) => Query::SetOperation(s),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(query, again, "{sql} printed as {text}");
+        }
+    }
+
+    #[test]
+    fn test_select_without_from() {
+        let s = select("SELECT 1 + 1");
+        assert!(s.from.is_none());
+        assert!(s.where_clause.is_none());
+        assert!(select("SELECT 1 WHERE TRUE").where_clause.is_some());
+    }
+
+    #[test]
+    fn test_parenthesized_queries() {
+        let top = set_operation("(SELECT a FROM t ORDER BY a LIMIT 2) UNION SELECT a FROM u");
+        let Query::Select(left) = &top.left else {
+            panic!("{:?}", top.left)
+        };
+        assert_eq!(left.limit, Some(2));
+        assert_eq!(left.order_by.len(), 1);
+        assert_eq!(top.limit, None);
+
+        let grouped =
+            set_operation("SELECT a FROM t UNION (SELECT a FROM u UNION SELECT a FROM v)");
+        assert!(matches!(grouped.right, Query::SetOperation(_)));
+
+        let plain = select("(SELECT a FROM t) ORDER BY a LIMIT 1");
+        assert_eq!(plain.limit, Some(1));
+        assert_eq!(plain.order_by.len(), 1);
+
+        assert!(unsupported("(SELECT a FROM t LIMIT 1) LIMIT 2").contains("parenthesized"));
+
+        match Parser::parse("INSERT INTO t SELECT a FROM u UNION SELECT a FROM v").unwrap() {
+            Statement::Insert(insert) => {
+                assert!(matches!(insert.source, InsertSource::SetOperation(_)))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn where_of(sql: &str) -> Expr {
+        select(sql).where_clause.unwrap()
+    }
+
+    #[test]
+    fn test_case_simple_and_searched() {
+        let searched = where_of("SELECT a FROM t WHERE CASE WHEN a > 1 THEN TRUE ELSE FALSE END");
+        let Expr::Case {
+            operand: None,
+            branches,
+            else_result: Some(_),
+        } = &searched
+        else {
+            panic!("{searched:?}")
+        };
+        assert_eq!(branches.len(), 1);
+
+        let simple =
+            where_of("SELECT a FROM t WHERE CASE a WHEN 1 THEN TRUE WHEN 2 THEN FALSE END");
+        let Expr::Case {
+            operand: Some(operand),
+            branches,
+            else_result: None,
+        } = &simple
+        else {
+            panic!("{simple:?}")
+        };
+        assert_eq!(operand.to_string(), "a");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(
+            simple.to_string(),
+            "CASE a WHEN 1 THEN TRUE WHEN 2 THEN FALSE END"
+        );
+    }
+
+    #[test]
+    fn test_cast_forms() {
+        for sql in [
+            "SELECT a FROM t WHERE CAST(a AS BIGINT) = 1",
+            "SELECT a FROM t WHERE a::INT = 1",
+        ] {
+            let Expr::BinaryOp { left, .. } = where_of(sql) else {
+                panic!("{sql}")
+            };
+            assert_eq!(
+                *left,
+                Expr::Cast {
+                    expr: Box::new(Expr::Column {
+                        table: None,
+                        name: "a".into()
+                    }),
+                    data_type: SqlDataType::Integer,
+                }
+            );
+            assert_eq!(left.to_string(), "CAST(a AS INTEGER)");
+        }
+        assert!(unsupported("SELECT TRY_CAST(a AS INT) FROM t").contains("TRY_CAST"));
+        assert!(Parser::parse("SELECT CAST(a AS BLOB) FROM t").is_err());
+    }
+
+    #[test]
+    fn test_substring_forms_become_substr() {
+        let args = |sql: &str| match where_of(sql) {
+            Expr::BinaryOp { left, .. } => match *left {
+                Expr::Function {
+                    name,
+                    args: FunctionArgs::List { args, .. },
+                } => {
+                    assert_eq!(name, "SUBSTR");
+                    args.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            args("SELECT a FROM t WHERE SUBSTR(a, 2, 3) = 'x'"),
+            ["a", "2", "3"]
+        );
+        assert_eq!(
+            args("SELECT a FROM t WHERE SUBSTRING(a FROM 2) = 'x'"),
+            ["a", "2"]
+        );
+        assert_eq!(
+            args("SELECT a FROM t WHERE SUBSTRING(a FOR 3) = 'x'"),
+            ["a", "1", "3"]
+        );
+        assert_eq!(
+            args("SELECT a FROM t WHERE SUBSTRING(a, 2) = 'x'"),
+            ["a", "2"]
+        );
     }
 
     #[test]
     fn test_insert_select_source() {
         match Parser::parse("INSERT INTO t (a) SELECT b FROM u WHERE b > 1").unwrap() {
             Statement::Insert(i) => match i.source {
-                InsertSource::Select(s) => assert_eq!(s.from.base, "u"),
+                InsertSource::Select(s) => assert_eq!(s.from.as_ref().unwrap().base, "u"),
                 other => panic!("Expected SELECT source, got {:?}", other),
             },
             other => panic!("Expected Insert, got {:?}", other),
@@ -2030,7 +2968,9 @@ mod tests {
             Parser::parse("CREATE TABLE t (a INT, PRIMARY KEY (missing))"),
             Err(ParseError::InvalidIdentifier(_))
         ));
-        assert!(unsupported("CREATE TABLE t (a INT CHECK (a > 0))").contains("CHECK"));
+        assert!(
+            unsupported("CREATE TABLE t (a INT, CHECK (a > 0) NOT ENFORCED)").contains("CHECK")
+        );
         assert!(unsupported("CREATE TABLE t (a INT REFERENCES u(id))").contains("REFERENCES"));
         assert!(unsupported("CREATE TABLE t AS SELECT 1").contains("AS SELECT"));
     }
@@ -2049,6 +2989,112 @@ mod tests {
         assert_eq!(
             rendered,
             vec!["COUNT(DISTINCT a)", "b || 'x'", "c NOT BETWEEN 1 AND 2"]
+        );
+    }
+
+    #[test]
+    fn test_most_negative_integer_literal_stays_an_integer() {
+        let s = select("SELECT -9223372036854775808, -5, 9223372036854775808 FROM t");
+        let exprs: Vec<&Expr> = s
+            .columns
+            .iter()
+            .map(|c| match c {
+                SelectColumn::Expr { expr, .. } => expr,
+                other => panic!("{:?}", other),
+            })
+            .collect();
+        assert_eq!(exprs[0], &Expr::Literal(LiteralValue::Integer(i64::MIN)));
+        assert!(matches!(
+            exprs[1],
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                ..
+            }
+        ));
+        assert!(matches!(exprs[2], Expr::Literal(LiteralValue::Float(_))));
+    }
+
+    #[test]
+    fn test_check_constraints() {
+        let Statement::CreateTable(create) = Parser::parse(
+            "CREATE TABLE t (a INT CHECK (a > 0), b INT CONSTRAINT b_pos CHECK (b >= 0), \
+             CHECK (a < b), CONSTRAINT pair CHECK (a + b < 100))",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let column_check = |i: usize| match &create.columns[i].constraints[..] {
+            [ColumnConstraint::Check(check)] => check.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(column_check(0).name, None);
+        assert_eq!(column_check(0).expr.to_string(), "a > 0");
+        assert_eq!(column_check(1).name.as_deref(), Some("b_pos"));
+        let names: Vec<_> = create.checks.iter().map(|c| c.name.as_deref()).collect();
+        assert_eq!(names, vec![None, Some("pair")]);
+        assert_eq!(create.checks[0].to_string(), "CHECK (a < b)");
+        assert_eq!(create.checks[1].to_string(), "CHECK constraint pair");
+    }
+
+    fn alter(sql: &str) -> AlterTable {
+        match Parser::parse(sql) {
+            Ok(Statement::AlterTable(alter)) => alter,
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_alter_table_operations() {
+        let add =
+            alter("ALTER TABLE IF EXISTS t ADD COLUMN IF NOT EXISTS c INT NOT NULL DEFAULT 3");
+        assert_eq!(add.name, "t");
+        assert!(add.if_exists);
+        let AlterOperation::AddColumn {
+            column,
+            if_not_exists: true,
+        } = &add.operation
+        else {
+            panic!("{add:?}")
+        };
+        assert_eq!(column.name, "c");
+        assert!(column.is_not_null());
+        assert_eq!(
+            column.default_value(),
+            Some(&Expr::Literal(LiteralValue::Integer(3)))
+        );
+
+        assert_eq!(
+            alter("ALTER TABLE t DROP c").operation,
+            AlterOperation::DropColumn {
+                name: "c".into(),
+                if_exists: false
+            }
+        );
+        assert_eq!(
+            alter("ALTER TABLE t DROP COLUMN IF EXISTS c").operation,
+            AlterOperation::DropColumn {
+                name: "c".into(),
+                if_exists: true
+            }
+        );
+        assert_eq!(
+            alter("ALTER TABLE t RENAME TO u").operation,
+            AlterOperation::RenameTable { name: "u".into() }
+        );
+        assert_eq!(
+            alter("ALTER TABLE t RENAME COLUMN a TO b").operation,
+            AlterOperation::RenameColumn {
+                old: "a".into(),
+                new: "b".into()
+            }
+        );
+
+        assert!(
+            unsupported("ALTER TABLE t ADD a INT, ADD b INT").contains("exactly one operation")
+        );
+        assert!(unsupported("ALTER TABLE t DROP COLUMN a CASCADE").contains("not supported"));
+        assert!(
+            unsupported("ALTER TABLE t ALTER COLUMN a SET DEFAULT 1").contains("not supported")
         );
     }
 }
