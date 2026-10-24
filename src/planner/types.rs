@@ -1,4 +1,4 @@
-use core::fmt;
+use std::fmt;
 
 use crate::sql::SqlDataType;
 
@@ -15,20 +15,23 @@ pub enum DataType {
 }
 
 impl DataType {
-    pub fn is_null(&self) -> bool {
-        self == &DataType::Null
+    pub fn is_null(self) -> bool {
+        self == DataType::Null
     }
 
-    pub fn is_numeric(&self) -> bool {
+    pub fn is_numeric(self) -> bool {
         matches!(self, DataType::Integer | DataType::Float)
     }
 
-    pub fn is_textual(&self) -> bool {
-        matches!(self, DataType::Text | DataType::Json | DataType::Uuid)
+    pub fn is_textual(self) -> bool {
+        matches!(
+            self,
+            DataType::Text | DataType::Json | DataType::Timestamp | DataType::Uuid
+        )
     }
 
-    pub fn is_boolean(&self) -> bool {
-        self == &DataType::Boolean
+    pub fn is_boolean(self) -> bool {
+        matches!(self, DataType::Boolean | DataType::Null)
     }
 
     pub fn numeric_result(self, other: DataType) -> Option<DataType> {
@@ -54,6 +57,17 @@ impl DataType {
             || self.is_null()
             || (self == DataType::Integer && target == DataType::Float)
             || (self == DataType::Text && target.is_textual())
+    }
+
+    pub fn can_cast_to(self, target: DataType) -> bool {
+        match (self, target) {
+            (a, b) if a == b => true,
+            (DataType::Null, _) | (_, DataType::Text) => true,
+            (a, b) if a.is_numeric() && b.is_numeric() => true,
+            (DataType::Boolean, DataType::Integer) | (DataType::Integer, DataType::Boolean) => true,
+            (a, b) if a.is_textual() => b.is_textual() || b.is_numeric() || b == DataType::Boolean,
+            _ => false,
+        }
     }
 
     pub fn unify(self, other: DataType) -> Option<DataType> {

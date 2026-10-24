@@ -1,12 +1,13 @@
 use crate::sql::{
-    CreateTable, Delete, DropTable, Expr, FunctionArgs, Insert, InsertSource, LiteralValue,
-    OrderBy, Select, SelectColumn, Statement, TableRef, UnaryOperator, Update,
+    AlterOperation, AlterTable, ColumnConstraint, CreateIndex, CreateTable, Delete, DropIndex,
+    DropTable, Expr, FunctionArgs, Insert, InsertSource, LiteralValue, OrderBy, Query, Select,
+    SelectColumn, SetOperation, SetOperator, Statement, TableRef, UnaryOperator, Update,
 };
 
-use super::catalog::{Catalog, TableSchema};
+use super::catalog::{AUTO_INDEX_PREFIX, Catalog, IndexDef, TableSchema, is_automatic_index_name};
 use super::error::{PlanError, PlanResult};
 use super::expr::{AggregateCall, AggregateFunction, ScalarExpr, ScalarFunction, SortKey};
-use super::logical::{LogicalPlan, Plan, UpdateAssignment};
+use super::logical::{AlterAction, LogicalPlan, Plan, UpdateAssignment};
 use super::schema::{ColumnIdGenerator, Field, Schema};
 use super::types::DataType;
 use super::value::Value;
@@ -94,6 +95,20 @@ fn column_ref(field: &Field) -> ScalarExpr {
     ScalarExpr::column(field.id, field.qualified_name(), field.data_type)
 }
 
+fn typed_literal(target: DataType, side: ScalarExpr, expr: &Expr) -> PlanResult<ScalarExpr> {
+    match &side {
+        ScalarExpr::Literal(value @ Value::Text(_))
+            if matches!(target, DataType::Timestamp | DataType::Uuid) =>
+        {
+            let value = value
+                .cast(target)
+                .map_err(|e| PlanError::TypeMismatch(format!("{e} in {expr}")))?;
+            Ok(ScalarExpr::Literal(value))
+        }
+        _ => Ok(side),
+    }
+}
+
 #[derive(Debug, Default)]
 struct AggregateSet {
     calls: Vec<AggregateCall>,
@@ -126,6 +141,7 @@ enum AggregateMode<'s> {
 }
 
 struct ExprBinder<'s> {
+    catalog: &'s Catalog,
     scope: &'s Scope,
     ids: &'s mut ColumnIdGenerator,
     mode: AggregateMode<'s>,
@@ -176,6 +192,11 @@ impl ExprBinder<'_> {
                         op.symbol()
                     )));
                 }
+                if op.is_comparison() {
+                    let l = typed_literal(rt, l, expr)?;
+                    let r = typed_literal(lt, r, expr)?;
+                    return Ok(ScalarExpr::binary(*op, l, r));
+                }
                 Ok(ScalarExpr::binary(*op, l, r))
             }
             Expr::IsNull {
@@ -202,6 +223,10 @@ impl ExprBinder<'_> {
                         bad.data_type()
                     )));
                 }
+                let list = list
+                    .into_iter()
+                    .map(|item| typed_literal(t, item, expr))
+                    .collect::<PlanResult<Vec<_>>>()?;
                 Ok(ScalarExpr::InList {
                     expr: Box::new(inner),
                     list,
@@ -224,6 +249,8 @@ impl ExprBinder<'_> {
                         "BETWEEN bounds are not comparable with {t} in {expr}"
                     )));
                 }
+                let low = typed_literal(t, low, expr)?;
+                let high = typed_literal(t, high, expr)?;
                 let range = ScalarExpr::and(
                     ScalarExpr::binary(crate::sql::BinaryOperator::GtEq, inner.clone(), low),
                     ScalarExpr::binary(crate::sql::BinaryOperator::LtEq, inner, high),
@@ -255,7 +282,157 @@ impl ExprBinder<'_> {
                 })
             }
             Expr::Function { name, args } => self.bind_function(expr, name, args),
+            Expr::Case {
+                operand,
+                branches,
+                else_result,
+            } => self.bind_case(expr, operand.as_deref(), branches, else_result.as_deref()),
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => {
+                let inner = self.bind(inner)?;
+                let to = DataType::from(data_type);
+                let from = inner.data_type();
+                if !from.can_cast_to(to) {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "cannot cast {from} to {to} in {expr}"
+                    )));
+                }
+                Ok(if from == to {
+                    inner
+                } else {
+                    ScalarExpr::Cast {
+                        expr: Box::new(inner),
+                        to,
+                    }
+                })
+            }
+            Expr::Subquery(query) => {
+                let plan = self.bind_subquery(query, Some("a subquery used as an expression"))?;
+                Ok(ScalarExpr::Subquery {
+                    plan: Box::new(plan),
+                })
+            }
+            Expr::Exists { query, negated } => {
+                let plan = self.bind_subquery(query, None)?;
+                Ok(ScalarExpr::Exists {
+                    plan: Box::new(plan),
+                    negated: *negated,
+                })
+            }
+            Expr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => {
+                let inner = self.bind(inner)?;
+                let plan = self.bind_subquery(query, Some("an IN subquery"))?;
+                let (t, item) = (inner.data_type(), plan.schema().field(0).data_type);
+                if !t.is_comparable_with(item) {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "IN subquery returns {item}, which is not comparable with {t} in {expr}"
+                    )));
+                }
+                Ok(ScalarExpr::InSubquery {
+                    expr: Box::new(inner),
+                    plan: Box::new(plan),
+                    negated: *negated,
+                })
+            }
         }
+    }
+
+    fn bind_subquery(
+        &mut self,
+        query: &Query,
+        one_column: Option<&str>,
+    ) -> PlanResult<LogicalPlan> {
+        let mut inner = Binder {
+            catalog: self.catalog,
+            ids: std::mem::take(self.ids),
+        };
+        let bound = inner.bind_query(query);
+        *self.ids = inner.ids;
+        let plan = bound.map_err(|err| self.correlation_error(err))?;
+        if let Some(context) = one_column {
+            let width = plan.schema().len();
+            if width != 1 {
+                return Err(PlanError::InvalidSubquery(format!(
+                    "{context} must return one column, got {width}"
+                )));
+            }
+        }
+        Ok(plan)
+    }
+
+    fn correlation_error(&self, err: PlanError) -> PlanError {
+        let outer = match &err {
+            PlanError::ColumnNotFound { table, column }
+                if self.scope.resolve(table.as_deref(), column).is_ok() =>
+            {
+                match table {
+                    Some(table) => format!("{table}.{column}"),
+                    None => column.clone(),
+                }
+            }
+            PlanError::AliasNotFound(alias) if self.scope.relation(alias).is_ok() => {
+                format!("table {alias}")
+            }
+            _ => return err,
+        };
+        PlanError::Unsupported(format!(
+            "correlated subqueries are not supported: {outer} refers to the outer query"
+        ))
+    }
+
+    fn bind_case(
+        &mut self,
+        expr: &Expr,
+        operand: Option<&Expr>,
+        branches: &[(Expr, Expr)],
+        else_result: Option<&Expr>,
+    ) -> PlanResult<ScalarExpr> {
+        let operand = operand.map(|o| self.bind(o)).transpose()?;
+        let mut bound = Vec::with_capacity(branches.len());
+        for (when, then) in branches {
+            let when = self.bind(when)?;
+            let condition = match &operand {
+                Some(operand) => {
+                    let (ot, wt) = (operand.data_type(), when.data_type());
+                    if !ot.is_comparable_with(wt) {
+                        return Err(PlanError::TypeMismatch(format!(
+                            "CASE operand of type {ot} cannot be compared with WHEN value {when} of type {wt}"
+                        )));
+                    }
+                    ScalarExpr::binary(crate::sql::BinaryOperator::Eq, operand.clone(), when)
+                }
+                None => {
+                    expect_boolean(&when, "CASE WHEN")?;
+                    when
+                }
+            };
+            bound.push((condition, self.bind(then)?));
+        }
+        let otherwise = match else_result {
+            Some(e) => self.bind(e)?,
+            None => ScalarExpr::Literal(Value::Null),
+        };
+        let result_type = bound
+            .iter()
+            .map(|(_, result)| result.data_type())
+            .chain(std::iter::once(otherwise.data_type()))
+            .try_fold(DataType::Null, DataType::unify)
+            .ok_or_else(|| {
+                PlanError::TypeMismatch(format!("CASE results have no common type in {expr}"))
+            })?;
+        Ok(ScalarExpr::Case {
+            branches: bound
+                .into_iter()
+                .map(|(condition, result)| (condition, result.cast(result_type)))
+                .collect(),
+            otherwise: Box::new(otherwise.cast(result_type)),
+        })
     }
 
     fn bind_function(
@@ -284,7 +461,12 @@ impl ExprBinder<'_> {
             }
         };
         let types: Vec<DataType> = args.iter().map(ScalarExpr::data_type).collect();
-        func.return_type(&types)?;
+        let result_type = func.return_type(&types)?;
+        let args = if func == ScalarFunction::Coalesce {
+            args.into_iter().map(|a| a.cast(result_type)).collect()
+        } else {
+            args
+        };
         Ok(ScalarExpr::Function { func, args })
     }
 
@@ -309,6 +491,7 @@ impl ExprBinder<'_> {
             FunctionArgs::List { args, distinct } => match args.as_slice() {
                 [single] => {
                     let mut inner = ExprBinder {
+                        catalog: self.catalog,
                         scope: self.scope,
                         ids: &mut *self.ids,
                         mode: AggregateMode::InsideAggregate(expr.to_string()),
@@ -372,6 +555,19 @@ fn ast_contains_aggregate(expr: &Expr) -> bool {
             ast_contains_aggregate(expr)
                 || ast_contains_aggregate(low)
                 || ast_contains_aggregate(high)
+        }
+        Expr::Cast { expr, .. } | Expr::InSubquery { expr, .. } => ast_contains_aggregate(expr),
+        Expr::Subquery(_) | Expr::Exists { .. } => false,
+        Expr::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(ast_contains_aggregate)
+                || branches
+                    .iter()
+                    .any(|(w, t)| ast_contains_aggregate(w) || ast_contains_aggregate(t))
+                || else_result.as_deref().is_some_and(ast_contains_aggregate)
         }
     }
 }
@@ -455,12 +651,18 @@ impl<'a> Binder<'a> {
     pub fn bind(&mut self, statement: &Statement) -> PlanResult<Plan> {
         match statement {
             Statement::Select(select) => self.bind_select(select).map(Plan::Query),
+            Statement::SetOperation(operation) => {
+                self.bind_set_operation(operation).map(Plan::Query)
+            }
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::CreateTable(create) => self.bind_create_table(create),
             Statement::DropTable(drop) => self.bind_drop_table(drop),
-            Statement::Begin => Ok(Plan::Begin),
+            Statement::CreateIndex(create) => self.bind_create_index(create),
+            Statement::DropIndex(drop) => self.bind_drop_index(drop),
+            Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            Statement::Begin(mode) => Ok(Plan::Begin(*mode)),
             Statement::Commit => Ok(Plan::Commit),
             Statement::Rollback => Ok(Plan::Rollback),
             Statement::ShowTables => Ok(Plan::ShowTables),
@@ -468,11 +670,204 @@ impl<'a> Binder<'a> {
                 let schema = self.catalog.get_table(table)?;
                 Ok(Plan::Describe(schema.name.clone()))
             }
+            Statement::Explain { analyze, statement } => {
+                let plan = match statement.as_ref() {
+                    Statement::Select(_) | Statement::SetOperation(_) => self.bind(statement)?,
+                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                        if !analyze =>
+                    {
+                        self.bind(statement)?
+                    }
+                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                        return Err(PlanError::Unsupported(
+                            "EXPLAIN ANALYZE runs only queries; use EXPLAIN for INSERT, UPDATE and DELETE".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(PlanError::Unsupported(
+                            "EXPLAIN takes a SELECT, INSERT, UPDATE or DELETE".into(),
+                        ));
+                    }
+                };
+                Ok(Plan::Explain {
+                    analyze: *analyze,
+                    plan: Box::new(plan),
+                })
+            }
         }
     }
 
+    pub fn bind_query(&mut self, query: &Query) -> PlanResult<LogicalPlan> {
+        match query {
+            Query::Select(select) => self.bind_select(select),
+            Query::SetOperation(operation) => self.bind_set_operation(operation),
+        }
+    }
+
+    pub fn bind_set_operation(&mut self, operation: &SetOperation) -> PlanResult<LogicalPlan> {
+        let op = operation.op;
+        let left = self.bind_query(&operation.left)?;
+        let right = self.bind_query(&operation.right)?;
+        let (left_width, right_width) = (left.schema().len(), right.schema().len());
+        if left_width != right_width {
+            return Err(PlanError::TypeMismatch(format!(
+                "each {op} query must have the same number of columns, got {left_width} and {right_width}"
+            )));
+        }
+
+        let types = left
+            .schema()
+            .fields()
+            .iter()
+            .zip(right.schema().fields())
+            .enumerate()
+            .map(|(i, (l, r))| {
+                l.data_type.unify(r.data_type).ok_or_else(|| {
+                    PlanError::TypeMismatch(format!(
+                        "{op} column {} has types {} and {}, which have no common type",
+                        i + 1,
+                        l.data_type,
+                        r.data_type
+                    ))
+                })
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        let left = self.cast_columns(left, &types);
+        let right = self.cast_columns(right, &types);
+
+        let fields: Vec<Field> = left
+            .schema()
+            .fields()
+            .iter()
+            .zip(right.schema().fields())
+            .map(|(l, r)| Field {
+                id: self.ids.next_id(),
+                qualifier: None,
+                name: l.name.clone(),
+                data_type: l.data_type,
+                nullable: match op {
+                    SetOperator::Union => l.nullable || r.nullable,
+                    SetOperator::Intersect => l.nullable && r.nullable,
+                    SetOperator::Except => l.nullable,
+                },
+            })
+            .collect();
+
+        let mut plan = LogicalPlan::SetOperation {
+            op,
+            all: operation.all,
+            left: Box::new(left),
+            right: Box::new(right),
+            schema: Schema::new(fields.clone()),
+        };
+
+        if !operation.order_by.is_empty() {
+            let mut scope = Scope::default();
+            scope.add("", fields.clone())?;
+            let keys = operation
+                .order_by
+                .iter()
+                .map(|ob| {
+                    Ok(SortKey {
+                        expr: self.bind_set_order_key(&ob.expr, &fields, &scope)?,
+                        ascending: ob.ascending,
+                        nulls_first: ob.nulls_first.unwrap_or(!ob.ascending),
+                    })
+                })
+                .collect::<PlanResult<Vec<_>>>()?;
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                keys,
+            };
+        }
+
+        if operation.limit.is_some() || operation.offset.is_some() {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                limit: operation.limit,
+                offset: operation.offset.unwrap_or(0),
+            };
+        }
+
+        Ok(plan)
+    }
+
+    fn bind_set_order_key(
+        &mut self,
+        expr: &Expr,
+        fields: &[Field],
+        scope: &Scope,
+    ) -> PlanResult<ScalarExpr> {
+        match expr {
+            Expr::Literal(LiteralValue::Integer(position)) => usize::try_from(*position)
+                .ok()
+                .and_then(|p| p.checked_sub(1))
+                .and_then(|p| fields.get(p))
+                .map(column_ref)
+                .ok_or(PlanError::PositionOutOfRange {
+                    clause: "ORDER BY",
+                    position: *position,
+                }),
+            Expr::Column { table: None, name }
+                if fields
+                    .iter()
+                    .filter(|f| f.name.eq_ignore_ascii_case(name))
+                    .count()
+                    > 1 =>
+            {
+                Err(PlanError::InvalidOrderBy(format!(
+                    "ORDER BY {name} is ambiguous"
+                )))
+            }
+            Expr::Column {
+                table: Some(table), ..
+            } => Err(PlanError::InvalidOrderBy(format!(
+                "ORDER BY of a set operation names output columns, not {table}.*"
+            ))),
+            other => self.bind_scalar(other, scope, "ORDER BY"),
+        }
+    }
+
+    fn cast_columns(&mut self, plan: LogicalPlan, types: &[DataType]) -> LogicalPlan {
+        if plan
+            .schema()
+            .fields()
+            .iter()
+            .zip(types)
+            .all(|(f, t)| f.data_type == *t)
+        {
+            return plan;
+        }
+        let (exprs, fields): (Vec<ScalarExpr>, Vec<Field>) = plan
+            .schema()
+            .fields()
+            .iter()
+            .zip(types)
+            .map(|(f, &t)| {
+                let field = Field {
+                    id: self.ids.next_id(),
+                    qualifier: f.qualifier.clone(),
+                    name: f.name.clone(),
+                    data_type: t,
+                    nullable: f.nullable,
+                };
+                (column_ref(f).cast(t), field)
+            })
+            .unzip();
+        LogicalPlan::project(plan, exprs, fields)
+    }
+
     pub fn bind_select(&mut self, select: &Select) -> PlanResult<LogicalPlan> {
-        let (mut plan, scope) = self.bind_from(&select.from)?;
+        let (mut plan, scope) = match &select.from {
+            Some(from) => self.bind_from(from)?,
+            None => (
+                LogicalPlan::Values {
+                    rows: vec![Vec::new()],
+                    schema: Schema::empty(),
+                },
+                Scope::default(),
+            ),
+        };
 
         if let Some(where_clause) = &select.where_clause {
             let predicate = self.bind_scalar(where_clause, &scope, "WHERE")?;
@@ -658,7 +1053,18 @@ impl<'a> Binder<'a> {
         let catalog = self.catalog;
         let table = catalog.get_table(name)?;
         let visible = alias.unwrap_or(name);
-        let fields: Vec<Field> = table
+        let fields = self.table_fields(table, visible);
+        scope.add(visible, fields.clone())?;
+        Ok(LogicalPlan::Scan {
+            table: table.name.clone(),
+            alias: alias.map(String::from),
+            projection: (0..fields.len()).collect(),
+            schema: Schema::new(fields),
+        })
+    }
+
+    fn table_fields(&mut self, table: &TableSchema, visible: &str) -> Vec<Field> {
+        table
             .columns
             .iter()
             .enumerate()
@@ -669,14 +1075,29 @@ impl<'a> Binder<'a> {
                 data_type: table.column_type(i),
                 nullable: table.is_nullable(i),
             })
-            .collect();
-        scope.add(visible, fields.clone())?;
-        Ok(LogicalPlan::Scan {
-            table: table.name.clone(),
-            alias: alias.map(String::from),
-            projection: (0..fields.len()).collect(),
-            schema: Schema::new(fields),
-        })
+            .collect()
+    }
+
+    pub fn bind_checks(&mut self, table: &TableSchema) -> PlanResult<(Schema, Vec<ScalarExpr>)> {
+        let fields = self.table_fields(table, &table.name);
+        let mut scope = Scope::default();
+        scope.add(&table.name, fields.clone())?;
+        let checks = table
+            .checks
+            .iter()
+            .map(|check| {
+                let bound = self.bind_scalar(&check.expr, &scope, "CHECK")?;
+                if bound.contains_subquery() {
+                    return Err(PlanError::Unsupported(format!(
+                        "cannot use subquery in {check} of table {}",
+                        table.name
+                    )));
+                }
+                expect_boolean(&bound, "CHECK")?;
+                Ok(bound)
+            })
+            .collect::<PlanResult<_>>()?;
+        Ok((Schema::new(fields), checks))
     }
 
     fn bind_scalar(
@@ -686,6 +1107,7 @@ impl<'a> Binder<'a> {
         clause: &'static str,
     ) -> PlanResult<ScalarExpr> {
         ExprBinder {
+            catalog: self.catalog,
             scope,
             ids: &mut self.ids,
             mode: AggregateMode::Forbidden(clause),
@@ -702,6 +1124,7 @@ impl<'a> Binder<'a> {
     ) -> PlanResult<ScalarExpr> {
         match group {
             Some(group) => ExprBinder {
+                catalog: self.catalog,
                 scope,
                 ids: &mut self.ids,
                 mode: AggregateMode::Allowed(&mut group.aggregates),
@@ -719,6 +1142,11 @@ impl<'a> Binder<'a> {
         let mut out = Vec::with_capacity(columns.len());
         for column in columns {
             match column {
+                SelectColumn::Wildcard if scope.relations.is_empty() => {
+                    return Err(PlanError::Unsupported(
+                        "SELECT * needs a FROM clause".into(),
+                    ));
+                }
                 SelectColumn::Wildcard => {
                     out.extend(scope.all_fields().cloned().map(ItemSource::Field));
                 }
@@ -959,19 +1387,11 @@ impl<'a> Binder<'a> {
             }
             InsertSource::Select(select) => {
                 let source = self.bind_select(select)?;
-                let width = source.schema().len();
-                if width != targets.len() {
-                    return Err(PlanError::InvalidInsert(format!(
-                        "INSERT has {} target columns but SELECT returns {width}",
-                        targets.len()
-                    )));
-                }
-                let mut provided: Vec<Option<ScalarExpr>> = vec![None; table.columns.len()];
-                for (field, &target) in source.schema().fields().iter().zip(&targets) {
-                    provided[target] = Some(column_ref(field));
-                }
-                let exprs = self.complete_insert_row(table, provided)?;
-                LogicalPlan::project(source, exprs, fields)
+                self.insert_from_query(table, &targets, fields, source)?
+            }
+            InsertSource::SetOperation(operation) => {
+                let source = self.bind_set_operation(operation)?;
+                self.insert_from_query(table, &targets, fields, source)?
             }
         };
 
@@ -979,6 +1399,28 @@ impl<'a> Binder<'a> {
             table: table.name.clone(),
             input,
         })
+    }
+
+    fn insert_from_query(
+        &mut self,
+        table: &TableSchema,
+        targets: &[usize],
+        fields: Vec<Field>,
+        source: LogicalPlan,
+    ) -> PlanResult<LogicalPlan> {
+        let width = source.schema().len();
+        if width != targets.len() {
+            return Err(PlanError::InvalidInsert(format!(
+                "INSERT has {} target columns but SELECT returns {width}",
+                targets.len()
+            )));
+        }
+        let mut provided: Vec<Option<ScalarExpr>> = vec![None; table.columns.len()];
+        for (field, &target) in source.schema().fields().iter().zip(targets) {
+            provided[target] = Some(column_ref(field));
+        }
+        let exprs = self.complete_insert_row(table, provided)?;
+        Ok(LogicalPlan::project(source, exprs, fields))
     }
 
     fn complete_insert_row(
@@ -1001,7 +1443,16 @@ impl<'a> Binder<'a> {
 
     fn bind_default(&mut self, table: &TableSchema, column: usize) -> PlanResult<ScalarExpr> {
         match table.columns[column].default_value() {
-            Some(expr) => self.bind_scalar(expr, &Scope::default(), "DEFAULT"),
+            Some(expr) => {
+                let bound = self.bind_scalar(expr, &Scope::default(), "DEFAULT")?;
+                if bound.contains_subquery() {
+                    return Err(PlanError::Unsupported(format!(
+                        "cannot use subquery in DEFAULT of column {}.{}",
+                        table.name, table.columns[column].name
+                    )));
+                }
+                Ok(bound)
+            }
             None => Ok(ScalarExpr::Literal(Value::Null)),
         }
     }
@@ -1092,9 +1543,174 @@ impl<'a> Binder<'a> {
                 self.coerce_to_column(&schema, column, value)?;
             }
         }
+        self.bind_checks(&schema)?;
         Ok(Plan::CreateTable {
             schema,
             if_not_exists: create.if_not_exists,
+        })
+    }
+
+    fn bind_create_index(&mut self, create: &CreateIndex) -> PlanResult<Plan> {
+        if is_automatic_index_name(&create.name) {
+            return Err(PlanError::Unsupported(format!(
+                "index names starting with {AUTO_INDEX_PREFIX} are reserved: {}",
+                create.name
+            )));
+        }
+        let schema = self.catalog.get_table(&create.table)?;
+        let columns = create
+            .columns
+            .iter()
+            .map(|name| {
+                schema
+                    .column_index(name)
+                    .ok_or_else(|| PlanError::ColumnNotFound {
+                        table: Some(schema.name.clone()),
+                        column: name.clone(),
+                    })
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        if self.catalog.has_index(&create.name) && !create.if_not_exists {
+            return Err(PlanError::IndexAlreadyExists(create.name.clone()));
+        }
+        Ok(Plan::CreateIndex {
+            index: IndexDef {
+                name: create.name.clone(),
+                table: schema.name.clone(),
+                columns,
+                unique: create.unique,
+            },
+            if_not_exists: create.if_not_exists,
+        })
+    }
+
+    fn bind_drop_index(&mut self, drop: &DropIndex) -> PlanResult<Plan> {
+        if !drop.if_exists {
+            let index = self.catalog.get_index(&drop.name)?;
+            if index.is_automatic() {
+                return Err(PlanError::Unsupported(format!(
+                    "index {} enforces a constraint of table {} and cannot be dropped",
+                    index.name, index.table
+                )));
+            }
+        }
+        Ok(Plan::DropIndex {
+            name: drop.name.clone(),
+            if_exists: drop.if_exists,
+        })
+    }
+
+    fn bind_alter_table(&mut self, alter: &AlterTable) -> PlanResult<Plan> {
+        let catalog = self.catalog;
+        let Ok(table) = catalog.get_table(&alter.name) else {
+            if alter.if_exists {
+                return Ok(Plan::AlterTable {
+                    table: alter.name.clone(),
+                    action: AlterAction::Nothing,
+                });
+            }
+            return Err(PlanError::TableNotFound(alter.name.clone()));
+        };
+        let qualified = |column: &str| format!("{}.{column}", table.name);
+        let action = match &alter.operation {
+            AlterOperation::AddColumn {
+                column,
+                if_not_exists,
+            } => {
+                if table.column_index(&column.name).is_some() && *if_not_exists {
+                    AlterAction::Nothing
+                } else {
+                    if column.constraints.iter().any(|c| {
+                        matches!(c, ColumnConstraint::PrimaryKey | ColumnConstraint::Unique)
+                    }) {
+                        return Err(PlanError::Unsupported(format!(
+                            "ADD COLUMN cannot add a PRIMARY KEY or UNIQUE column ({}); add the column, then CREATE UNIQUE INDEX",
+                            qualified(&column.name)
+                        )));
+                    }
+                    let next = table.with_column_added(column.clone())?;
+                    let index = next.columns.len() - 1;
+                    self.bind_checks(&next)?;
+                    let fill = match column.default_value() {
+                        Some(_) => {
+                            let value = self.bind_default(&next, index)?;
+                            self.coerce_to_column(&next, index, value)?
+                        }
+                        None => ScalarExpr::Literal(Value::Null),
+                    };
+                    AlterAction::AddColumn {
+                        column: column.clone(),
+                        fill,
+                    }
+                }
+            }
+            AlterOperation::DropColumn { name, if_exists } => match table.column_index(name) {
+                None if *if_exists => AlterAction::Nothing,
+                None => {
+                    return Err(PlanError::ColumnNotFound {
+                        table: Some(table.name.clone()),
+                        column: name.clone(),
+                    });
+                }
+                Some(column) => {
+                    let name = qualified(&table.columns[column].name);
+                    let reason = if table.columns.len() == 1 {
+                        Some("it is the only column of the table".to_string())
+                    } else if table.primary_key.contains(&column) {
+                        Some("it is part of the primary key".to_string())
+                    } else if table.unique_keys.iter().any(|k| k.contains(&column)) {
+                        Some("it is part of a UNIQUE constraint".to_string())
+                    } else if let Some(check) = table.check_using(column) {
+                        Some(format!("{check} uses it"))
+                    } else {
+                        catalog
+                            .indexes_on(&table.name)
+                            .into_iter()
+                            .find(|index| index.columns.contains(&column))
+                            .map(|index| {
+                                format!("index {} uses it; drop the index first", index.name)
+                            })
+                    };
+                    if let Some(reason) = reason {
+                        return Err(PlanError::Unsupported(format!(
+                            "cannot drop column {name}: {reason}"
+                        )));
+                    }
+                    AlterAction::DropColumn { column }
+                }
+            },
+            AlterOperation::RenameTable { name } => {
+                if catalog.has_table(name) && !name.eq_ignore_ascii_case(&table.name) {
+                    return Err(PlanError::TableAlreadyExists(name.clone()));
+                }
+                for index in catalog.indexes_on(&table.name) {
+                    let renamed = index.for_table_named(name);
+                    let taken = catalog
+                        .get_index(&renamed.name)
+                        .is_ok_and(|other| !other.table.eq_ignore_ascii_case(&table.name));
+                    if taken {
+                        return Err(PlanError::IndexAlreadyExists(renamed.name));
+                    }
+                }
+                AlterAction::RenameTable { name: name.clone() }
+            }
+            AlterOperation::RenameColumn { old, new } => {
+                let column = table
+                    .column_index(old)
+                    .ok_or_else(|| PlanError::ColumnNotFound {
+                        table: Some(table.name.clone()),
+                        column: old.clone(),
+                    })?;
+                table.with_column_renamed(column, new)?;
+                AlterAction::RenameColumn {
+                    column,
+                    name: new.clone(),
+                }
+            }
+        };
+        Ok(Plan::AlterTable {
+            table: table.name.clone(),
+            action,
         })
     }
 
