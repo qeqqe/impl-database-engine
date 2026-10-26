@@ -8,3 +8,14 @@ pub mod scan;
 pub mod set_operation;
 pub mod sort;
 pub mod values;
+
+pub use aggregate::HashAggregateExec;
+pub use distinct::DistinctExec;
+pub use filter::FilterExec;
+pub use join::{HashJoinExec, NestedLoopJoinExec};
+pub use limit::LimitExec;
+pub use project::ProjectExec;
+pub use scan::{ScanExec, ScanKind};
+pub use set_operation::SetOpExec;
+pub use sort::{SortExec, TopNExec};
+pub use values::ValuesExec;

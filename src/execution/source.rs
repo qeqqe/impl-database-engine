@@ -19,7 +19,7 @@ pub trait TableSource {
         key_column: usize,
         range: &KeyRange,
     ) -> ExecResult<RowStream<'_>> {
-        let range = *range;
+        let range = range.clone();
         let rows = self.scan(table)?;
         Ok(Box::new(rows.filter(move |row| match row {
             Ok(row) => matches!(row.get(key_column), Some(Value::Integer(k)) if range.contains(*k)),

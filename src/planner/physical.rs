@@ -16,7 +16,7 @@ use crate::{
 };
 
 // tis stores the node's id range
-#[derive(Clone, Copy, PartialEq, Debug, Eq)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 pub struct KeyRange {
     pub upper: Bound<i64>,
     pub lower: Bound<i64>,
