@@ -33,6 +33,10 @@ impl std::error::Error for ParseError {}
 
 impl From<sqlparser::parser::ParserError> for ParseError {
     fn from(err: sqlparser::parser::ParserError) -> Self {
-        ParseError::SqlParser(err.to_string())
+        use sqlparser::parser::ParserError as E;
+        ParseError::SqlParser(match err {
+            E::ParserError(message) | E::TokenizerError(message) => message,
+            E::RecursionLimitExceeded => "statement is nested too deeply".to_string(),
+        })
     }
 }

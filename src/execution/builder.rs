@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_variables, unused_mut)]
+
 use crate::{
     execution::{operator::BoxedOperator, source::TableSource},
     planner::physical::PhysicalPlan,

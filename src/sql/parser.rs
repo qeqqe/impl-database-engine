@@ -1201,14 +1201,31 @@ impl Parser {
             sp::Expr::Value(v) => Ok(Expr::Literal(Self::convert_value(v)?)),
 
             sp::Expr::BinaryOp { left, op, right } => {
-                let l = Self::convert_expr(left)?;
-                let r = Self::convert_expr(right)?;
-                let o = Self::convert_binary_op(op)?;
-                Ok(Expr::BinaryOp {
-                    left: Box::new(l),
-                    op: o,
-                    right: Box::new(r),
-                })
+                let mut ops = vec![(op, right.as_ref())];
+                let mut current = left.as_ref();
+                let mut spine_guards = Vec::new();
+                while let sp::Expr::BinaryOp {
+                    left: next_left,
+                    op: next_op,
+                    right: next_right,
+                } = current
+                {
+                    spine_guards.push(ExprDepth::enter()?);
+                    ops.push((next_op, next_right.as_ref()));
+                    current = next_left.as_ref();
+                }
+                let mut acc = Self::convert_expr(current)?;
+                while let Some((next_op, next_right)) = ops.pop() {
+                    let _guard = spine_guards.pop();
+                    let r = Self::convert_expr(next_right)?;
+                    let o = Self::convert_binary_op(next_op)?;
+                    acc = Expr::BinaryOp {
+                        left: Box::new(acc),
+                        op: o,
+                        right: Box::new(r),
+                    };
+                }
+                Ok(acc)
             }
 
             sp::Expr::UnaryOp { op, expr } => {
