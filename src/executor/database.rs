@@ -1,6 +1,15 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64},
+    },
+};
 
-use crate::{executor::lock::LockManager, storage::engine::bplus_tree::BplusTree};
+use crate::{
+    executor::{keys::TableId, lock::LockManager, source::CatalogState},
+    storage::engine::bplus_tree::BplusTree,
+};
 
 pub(super) const READ_ONLY_TXN: u64 = 0;
 pub const MAX_ROW_BYTES: usize = 1024 * 1024;
@@ -11,6 +20,8 @@ const DATA_FILES: [&str; 3] = ["data.idx", "data.heap", "data.wal"];
 pub(super) struct Engine {
     pub(super) tree: BplusTree,
     pub(super) lock: LockManager,
+    catalog: RwLock<Arc<CatalogState>>,
+    row_ids: Mutex<HashMap<TableId, u64>>,
     next_txn_id: AtomicU64,
     next_session_id: AtomicU64,
     closed: AtomicBool,

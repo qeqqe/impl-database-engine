@@ -22,6 +22,8 @@ pub(super) const HEADER_SIZE: usize = 8 + 2 + 2 + 1 + 1 + 8;
 pub(super) const KEY_SIZE: usize = 8;
 pub(super) const PTR_SIZE: usize = 8;
 
+pub type Key = u128;
+
 pub(super) const SLOT_SIZE: usize = 4; // cell_offset: u16 + cell_size: u16
 
 /// max seperator keys in a page
