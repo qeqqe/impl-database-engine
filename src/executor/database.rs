@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    executor::{keys::TableId, lock::LockManager, source::CatalogState},
+    executor::{keys::TableId, lock::LockManager, session::Session, source::CatalogState},
     storage::engine::bplus_tree::BplusTree,
 };
 
@@ -25,4 +25,8 @@ pub(super) struct Engine {
     next_txn_id: AtomicU64,
     next_session_id: AtomicU64,
     closed: AtomicBool,
+}
+
+pub struct Database {
+    session: Session,
 }

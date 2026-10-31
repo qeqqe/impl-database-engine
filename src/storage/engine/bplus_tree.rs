@@ -12,6 +12,7 @@ pub(super) mod buffer_pool;
 pub(super) mod header;
 pub(super) mod heap;
 pub(super) mod index;
+pub(super) mod io;
 pub(super) mod pager;
 pub(super) mod slotted_page;
 pub(super) mod wal;
