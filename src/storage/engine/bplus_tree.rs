@@ -9,12 +9,14 @@ use pager::Pager;
 use slotted_page::Cell;
 
 pub(super) mod buffer_pool;
+pub(super) mod crc;
 pub(super) mod header;
 pub(super) mod heap;
 pub(super) mod index;
 pub(super) mod io;
 pub(super) mod pager;
 pub(super) mod slotted_page;
+pub(super) mod sync;
 pub(super) mod wal;
 pub(super) mod wal_buffer;
 
