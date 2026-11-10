@@ -1,5 +1,7 @@
-pub(crate) const HEAP_HEADER_SIZE: usize = 21;
-pub(crate) const WAL_HEADER_SIZE: usize = 28;
+pub(crate) const HEAP_CRC_OFFSET: usize = 21;
+pub(crate) const HEAP_HEADER_SIZE: usize = HEAP_CRC_OFFSET + 4;
+pub(crate) const WAL_HEADER_SIZE: usize = 40;
+pub(crate) const WAL_MAGIC: [u8; 4] = *b"IWAL";
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
@@ -31,18 +33,25 @@ pub(super) struct IndexHeader {
     /// when the page is an Internal/Root node
     /// else as a right sibling leaf pointer when a Leaf node...
     pub ptr: u64, // 14..22
-} // 22
+} // 22, then the page checksum at 22..26
 
 impl IndexHeader {
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        Some(IndexHeader {
-            id: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            free_start: u16::from_le_bytes(buf[8..10].try_into().ok()?),
-            free_end: u16::from_le_bytes(buf[10..12].try_into().ok()?),
-            page_ty: PageKind::from_u8(buf[12])?,
-            flags: u8::from_le(buf[13]),
-            ptr: u64::from_le_bytes(buf[14..22].try_into().ok()?),
-        })
+        let header = IndexHeader {
+            id: u64::from_le_bytes(buf.get(0..8)?.try_into().ok()?),
+            free_start: u16::from_le_bytes(buf.get(8..10)?.try_into().ok()?),
+            free_end: u16::from_le_bytes(buf.get(10..12)?.try_into().ok()?),
+            page_ty: PageKind::from_u8(*buf.get(12)?)?,
+            flags: u8::from_le(*buf.get(13)?),
+            ptr: u64::from_le_bytes(buf.get(14..22)?.try_into().ok()?),
+        };
+        let start = header.free_start as usize;
+        let end = header.free_end as usize;
+        let well_formed = start >= super::HEADER_SIZE
+            && start <= end
+            && end <= super::PAGE_SIZE
+            && (start - super::HEADER_SIZE).is_multiple_of(super::SLOT_SIZE);
+        well_formed.then_some(header)
     }
 
     pub fn serialize(&self, buf: &mut [u8]) {
@@ -114,17 +123,24 @@ pub(super) struct HeapHeader {
     /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have
     /// an overflow page, where `ptr` indicates nothing.
     pub ptr: u64,
-} // 21
+} // 21, then the page checksum at 21..25
 
 impl HeapHeader {
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        Some(HeapHeader {
-            id: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            free_start: u16::from_le_bytes(buf[8..10].try_into().ok()?),
-            free_end: u16::from_le_bytes(buf[10..12].try_into().ok()?),
-            flags: u8::from_le(buf[12]),
-            ptr: u64::from_le_bytes(buf[13..21].try_into().ok()?),
-        })
+        let header = HeapHeader {
+            id: u64::from_le_bytes(buf.get(0..8)?.try_into().ok()?),
+            free_start: u16::from_le_bytes(buf.get(8..10)?.try_into().ok()?),
+            free_end: u16::from_le_bytes(buf.get(10..12)?.try_into().ok()?),
+            flags: u8::from_le(*buf.get(12)?),
+            ptr: u64::from_le_bytes(buf.get(13..21)?.try_into().ok()?),
+        };
+        let start = header.free_start as usize;
+        let end = header.free_end as usize;
+        let well_formed = start >= HEAP_HEADER_SIZE
+            && start <= end
+            && end <= super::heap::PAGE_SIZE
+            && (start - HEAP_HEADER_SIZE).is_multiple_of(super::heap::SLOT_SIZE);
+        well_formed.then_some(header)
     }
 
     pub fn serialize(&self, buf: &mut [u8]) {
@@ -164,16 +180,17 @@ impl HeapHeader {
     }
 
     pub fn is_overflow_page(&self) -> bool {
-        self.flags & 1 == 1
+        self.flags & 0x01 == 0
     }
 
     pub fn has_overflow_page(&self) -> bool {
-        (self.flags >> 1) == 1
+        self.flags & 0x02 != 0
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WalHeader {
+    pub salt: u32,
     pub last_checkpoint_lsn: u64,
     pub last_wal_offset: u64, // we can use this to trace the last WAL and walk back
     pub last_wal_len: u32,
@@ -184,19 +201,30 @@ pub(super) struct WalHeader {
 
 impl WalHeader {
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < WAL_HEADER_SIZE || buf[0..4] != WAL_MAGIC {
+            return None;
+        }
+        let stored = u32::from_le_bytes(buf[36..40].try_into().ok()?);
+        if super::crc::crc32c(&buf[0..36]) != stored {
+            return None;
+        }
         Some(Self {
-            last_checkpoint_lsn: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            last_wal_offset: u64::from_le_bytes(buf[8..16].try_into().ok()?),
-            last_wal_len: u32::from_le_bytes(buf[16..20].try_into().ok()?),
-            next_lsn: u64::from_le_bytes(buf[20..28].try_into().ok()?),
+            salt: u32::from_le_bytes(buf[4..8].try_into().ok()?),
+            last_checkpoint_lsn: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            last_wal_offset: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+            last_wal_len: u32::from_le_bytes(buf[24..28].try_into().ok()?),
+            next_lsn: u64::from_le_bytes(buf[28..36].try_into().ok()?),
         })
     }
 
     pub fn serialize(&self, buf: &mut [u8]) {
-        buf[0..8].copy_from_slice(&self.last_checkpoint_lsn.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.last_wal_offset.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.last_wal_len.to_le_bytes());
-        buf[20..28].copy_from_slice(&self.next_lsn.to_le_bytes());
+        buf[0..4].copy_from_slice(&WAL_MAGIC);
+        buf[4..8].copy_from_slice(&self.salt.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.last_checkpoint_lsn.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.last_wal_offset.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.last_wal_len.to_le_bytes());
+        buf[28..36].copy_from_slice(&self.next_lsn.to_le_bytes());
+        let crc = super::crc::crc32c(&buf[0..36]);
+        buf[36..40].copy_from_slice(&crc.to_le_bytes());
     }
 }
-

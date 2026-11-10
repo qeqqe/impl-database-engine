@@ -7,32 +7,87 @@
 
 // TODO: implement overflow pages cus they are bound to exist
 
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::error::Error;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{error::Error, os::unix::fs::FileExt};
-
-use crate::storage::engine::bplus_tree::header::HEAP_HEADER_SIZE;
+use std::sync::{Arc, Mutex};
 
 use super::buffer_pool::BufferPool;
+use super::crc;
+use super::header::HEAP_CRC_OFFSET;
+use super::io::FileRef;
 use super::slotted_page::HeapPage;
+use super::sync::lock;
 use super::wal::Wal;
 
 use super::{header::HeapHeader, slotted_page::CellPointer};
 
 pub(super) const PAGE_SIZE: usize = 8192;
-pub(super) const HEADER_SIZE: usize = 21;
+pub(super) const HEADER_SIZE: usize = super::header::HEAP_HEADER_SIZE;
 pub(super) const SLOT_SIZE: usize = 4;
+pub(super) const MAX_RECORD_SIZE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
+pub(super) const SHARED_MAX_BLOB: usize = (PAGE_SIZE - HEADER_SIZE) / 2;
+pub(super) const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const CHAIN_SLOT: u16 = u16::MAX;
+const MIN_TRACKED_FREE: usize = 64;
+
+pub(super) fn pack_ptr(page: u64, slot: u16) -> u64 {
+    (page << 16) | slot as u64
+}
+
+pub(super) fn unpack_ptr(ptr: u64) -> (u64, u16) {
+    (ptr >> 16, (ptr & 0xFFFF) as u16)
+}
+
+pub(super) fn encoded_blob_len(records: &[Vec<u8>]) -> usize {
+    4 + records.iter().map(|r| 4 + r.len()).sum::<usize>()
+}
+
+pub(super) fn encode_blob(records: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = records.iter().map(|r| 4 + r.len()).sum();
+    let mut out = Vec::with_capacity(4 + total);
+    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for record in records {
+        out.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        out.extend_from_slice(record);
+    }
+    out
+}
+
+pub(super) fn decode_blob(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut rest = bytes;
+    let mut take = |n: usize| -> Result<&[u8], Box<dyn Error>> {
+        if rest.len() < n {
+            return Err("heap blob is truncated".into());
+        }
+        let (head, tail) = rest.split_at(n);
+        rest = tail;
+        Ok(head)
+    };
+    let count = u32::from_le_bytes(take(4)?.try_into()?) as usize;
+    let mut records = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(4)?.try_into()?) as usize;
+        records.push(take(len)?.to_vec());
+    }
+    if !rest.is_empty() {
+        return Err("heap blob has trailing bytes".into());
+    }
+    Ok(records)
+}
 
 const HEAP_POOL_CAPACITY: usize = 10_000;
 
 pub(super) struct Heap {
-    pub heap_file: File,
+    pub heap_file: FileRef,
     pub path: std::path::PathBuf,
     pub next_id: AtomicU64,
     pub pool: BufferPool<HeapPage>,
     pub wal: Arc<Wal>,
+    free_pages: Mutex<BTreeSet<u64>>,
+    shared_space: Mutex<BTreeMap<u64, usize>>,
+    replay_pages: Mutex<HashSet<u64>>,
 }
 
 pub(super) struct HeapPageGuard<'a> {
@@ -62,27 +117,78 @@ impl<'a> Drop for HeapPageGuard<'a> {
 }
 
 impl Heap {
-    pub fn new(heap_file: File, path: std::path::PathBuf, wal: Arc<Wal>) -> Self {
+    pub fn new(
+        heap_file: FileRef,
+        path: std::path::PathBuf,
+        wal: Arc<Wal>,
+    ) -> Result<Self, Box<dyn Error>> {
         Self::new_with_capacity(heap_file, path, wal, HEAP_POOL_CAPACITY)
     }
 
     pub fn new_with_capacity(
-        heap_file: File,
+        heap_file: FileRef,
         path: std::path::PathBuf,
         wal: Arc<Wal>,
         capacity: usize,
-    ) -> Self {
-        let next_id = heap_file
-            .metadata()
-            .map(|m| m.len() / PAGE_SIZE as u64)
-            .unwrap_or(0);
-        Heap {
+    ) -> Result<Self, Box<dyn Error>> {
+        let next_id = heap_file.len()? / PAGE_SIZE as u64;
+        Ok(Heap {
             heap_file,
             path,
             next_id: AtomicU64::new(next_id),
             pool: BufferPool::new(capacity),
             wal,
+            free_pages: Mutex::new(BTreeSet::new()),
+            shared_space: Mutex::new(BTreeMap::new()),
+            replay_pages: Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn poisoning<T, E: Into<Box<dyn Error>>>(
+        &self,
+        result: Result<T, E>,
+    ) -> Result<T, Box<dyn Error>> {
+        result.map_err(|e| {
+            self.wal.poison();
+            e.into()
+        })
+    }
+
+    fn write_back(&self, id: u64, page: &HeapPage, page_lsn: u64) -> Result<(), Box<dyn Error>> {
+        if page_lsn > 0 {
+            self.wal.flush_up_to(page_lsn)?;
         }
+        self.write_sealed(id, &page.data)
+    }
+
+    fn write_sealed(&self, id: u64, data: &[u8; PAGE_SIZE]) -> Result<(), Box<dyn Error>> {
+        let mut sealed = *data;
+        crc::seal_page(&mut sealed, HEAP_CRC_OFFSET);
+        self.poisoning(self.heap_file.write_at(&sealed, Self::page_offset(id)))
+    }
+
+    pub fn expect_replay(&self, ids: impl IntoIterator<Item = u64>) {
+        lock(&self.replay_pages).extend(ids);
+    }
+
+    pub fn end_replay(&self) {
+        lock(&self.replay_pages).clear();
+    }
+
+    fn cache(&self, id: u64, page: HeapPage) -> Result<(), Box<dyn Error>> {
+        let result = self
+            .pool
+            .insert_with_write_back(id, page, |vid, vpage, lsn| self.write_back(vid, vpage, lsn));
+        self.poisoning(result)
+    }
+
+    pub fn ensure_page(&self, id: u64) -> Result<(), Box<dyn Error>> {
+        let required = Self::page_offset(id) + PAGE_SIZE as u64;
+        if self.heap_file.len()? < required {
+            self.poisoning(self.heap_file.set_len(required))?;
+        }
+        self.next_id.fetch_max(id + 1, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn get_record(
@@ -96,11 +202,7 @@ impl Heap {
 
         let cell_ptrs = Self::get_cell_ptr(&page.data, &header);
         for cell_ptr in &cell_ptrs {
-            let off = cell_ptr.cell_offset as usize;
-            let size = cell_ptr.cell_size as usize;
-            let mut data = vec![0u8; size];
-            data.copy_from_slice(&page.data[off..off + size]);
-            data_records.push(data);
+            data_records.push(Self::cell_bytes(&page.data, &header, cell_ptr)?.to_vec());
         }
 
         let has_overflow = header.has_overflow_page();
@@ -119,16 +221,14 @@ impl Heap {
         data_records: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
         let mut cur_id = overflow_id;
+        let mut steps = 0;
         loop {
+            self.check_chain_step(&mut steps, cur_id)?;
             let page = self.fetch(cur_id)?;
             let header = page.header()?;
             let cell_ptrs = Self::get_cell_ptr(&page.data, &header);
-            for cell_ptr in cell_ptrs {
-                let start = cell_ptr.cell_offset as usize;
-                let end = start + cell_ptr.cell_size as usize;
-                let mut data_record = vec![0u8; end - start];
-                data_record.copy_from_slice(&page.data[start..end]);
-                data_records.push(data_record);
+            for cell_ptr in &cell_ptrs {
+                data_records.push(Self::cell_bytes(&page.data, &header, cell_ptr)?.to_vec());
             }
 
             if header.has_overflow_page() {
@@ -138,6 +238,34 @@ impl Heap {
             }
         }
 
+        Ok(())
+    }
+
+    fn cell_bytes<'p>(
+        buf: &'p [u8],
+        header: &HeapHeader,
+        cell_ptr: &CellPointer,
+    ) -> Result<&'p [u8], Box<dyn Error>> {
+        let start = cell_ptr.cell_offset as usize;
+        let end = start + cell_ptr.cell_size as usize;
+        if start < header.free_end as usize || end > PAGE_SIZE {
+            return Err(format!(
+                "corrupt heap page {}: record at {start}..{end} lies outside the record area",
+                header.id
+            )
+            .into());
+        }
+        Ok(&buf[start..end])
+    }
+
+    fn check_chain_step(&self, steps: &mut u64, id: u64) -> Result<(), Box<dyn Error>> {
+        *steps += 1;
+        if *steps > self.page_count() || id >= self.page_count() {
+            return Err(format!(
+                "corrupt heap chain: page {id} is out of range or part of a cycle"
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -155,20 +283,28 @@ impl Heap {
     }
 
     pub fn fetch(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
+        self.wal.check()?;
         if let Some(page) = self.pool.get(id) {
             return Ok(page);
         }
         let page = self.read_page_from_disk(id)?;
-        if let Some(evicted) = self.pool.insert(id, page)?
-            && evicted.was_dirty
-        {
-            if evicted.page_lsn > 0 {
-                self.wal.flush_up_to(evicted.page_lsn)?;
-            }
-            self.heap_file
-                .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
-        }
+        self.cache(id, page)?;
         Ok(page)
+    }
+
+    pub fn with_page<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&HeapPage) -> R,
+    ) -> Result<R, Box<dyn Error>> {
+        self.wal.check()?;
+        let mut f = Some(f);
+        if let Some(result) = self.pool.with(id, |page| (f.take().unwrap())(page)) {
+            return Ok(result);
+        }
+        let page = self.read_page_from_disk(id)?;
+        self.cache(id, page)?;
+        Ok((f.take().unwrap())(&page))
     }
 
     pub fn fetch_mut(&self, id: u64) -> Result<HeapPageGuard<'_>, Box<dyn Error>> {
@@ -186,60 +322,87 @@ impl Heap {
         self.pool.update_page(id, page);
     }
 
-    pub fn allocate(&self) -> u64 {
+    pub fn allocate(&self) -> Result<u64, Box<dyn Error>> {
+        self.wal.check()?;
+        if let Some(id) = lock(&self.free_pages).pop_first() {
+            return Ok(id);
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let end_offset = Self::page_offset(id) + PAGE_SIZE as u64;
-        self.heap_file
-            .set_len(end_offset)
-            .expect("Failed to set length of heap file");
+        if self.heap_file.len()? < end_offset {
+            self.poisoning(self.heap_file.set_len(end_offset))?;
+        }
 
-        let header = HeapHeader {
-            id,
-            ptr: 0,
-            free_start: HEAP_HEADER_SIZE as u16,
-            free_end: PAGE_SIZE as u16,
-            flags: 0,
-        };
-        let mut page = HeapPage {
+        let page = HeapPage {
             data: [0u8; PAGE_SIZE],
         };
-        header.serialize(&mut page.data[..HEADER_SIZE]);
 
-        if let Some(evicted) = self
-            .pool
-            .insert(id, page)
-            .expect("Buffer pool capacity exceeded during allocate (all pages pinned)")
-            && evicted.was_dirty
-        {
-            if evicted.page_lsn > 0 {
-                self.wal
-                    .flush_up_to(evicted.page_lsn)
-                    .expect("Failed to flush WAL during allocate");
-            }
-            self.heap_file
-                .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
-                .expect("Failed to write-back stolen page during allocate");
-        }
+        self.pool.remove(id);
+        self.cache(id, page)?;
         self.pool.mark_dirty(id);
 
-        id
+        Ok(id)
     }
 
-    pub fn allocate_primary(&self) -> u64 {
-        let id = self.allocate();
-        let mut page = self.fetch_mut(id).unwrap();
+    pub fn release(&self, ids: impl IntoIterator<Item = u64>) {
+        lock(&self.free_pages).extend(ids);
+    }
+
+    pub fn find_shared_page(&self, needed: usize) -> Option<u64> {
+        lock(&self.shared_space)
+            .iter()
+            .find(|(_, free)| **free >= needed)
+            .map(|(id, _)| *id)
+    }
+
+    pub fn note_shared_space(&self, id: u64, free: usize) {
+        let mut space = lock(&self.shared_space);
+        if free >= MIN_TRACKED_FREE {
+            space.insert(id, free);
+        } else {
+            space.remove(&id);
+        }
+    }
+
+    pub fn forget_shared_page(&self, id: u64) {
+        lock(&self.shared_space).remove(&id);
+    }
+
+    pub fn reset_space(&self, free_pages: BTreeSet<u64>, shared: Vec<(u64, usize)>) {
+        *lock(&self.free_pages) = free_pages;
+        let mut space = lock(&self.shared_space);
+        space.clear();
+        for (id, free) in shared {
+            if free >= MIN_TRACKED_FREE {
+                space.insert(id, free);
+            }
+        }
+    }
+
+    pub fn page_count(&self) -> u64 {
+        self.next_id.load(Ordering::SeqCst)
+    }
+
+    pub fn free_page_count(&self) -> usize {
+        lock(&self.free_pages).len()
+    }
+
+    pub fn allocate_primary(&self) -> Result<u64, Box<dyn Error>> {
+        let id = self.allocate()?;
+        let mut page = self.fetch_mut(id)?;
         let header = HeapHeader::new_primary(id);
         header.serialize(&mut page.data[..HEADER_SIZE]);
-        id
+        Ok(id)
     }
 
-    pub fn allocate_overflow(&self) -> u64 {
-        let id = self.allocate();
-        let mut page = self.fetch_mut(id).unwrap();
+    pub fn allocate_overflow(&self) -> Result<u64, Box<dyn Error>> {
+        let id = self.allocate()?;
+        let mut page = self.fetch_mut(id)?;
         let header = HeapHeader::new_overflow(id);
         header.serialize(&mut page.data[..HEADER_SIZE]);
-        id
+        Ok(id)
     }
 
     pub fn insert_records(
@@ -254,7 +417,7 @@ impl Heap {
 
         let mut current_id = primary_page_id;
 
-        if header.is_overflow_page() {
+        if header.has_overflow_page() {
             current_id = self.find_tail_id(header.ptr)?;
         }
 
@@ -271,7 +434,7 @@ impl Heap {
                 let mut page = self.fetch_mut(current_id)?;
                 page.add_cell(record)?;
             } else {
-                let overflow_id = self.allocate_overflow();
+                let overflow_id = self.allocate_overflow()?;
 
                 {
                     let mut current_page = self.fetch_mut(current_id)?;
@@ -294,8 +457,10 @@ impl Heap {
 
     fn read_page_from_disk(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
         let mut buf = [0u8; PAGE_SIZE];
-        self.heap_file
-            .read_exact_at(&mut buf, Self::page_offset(id))?;
+        self.heap_file.read_at(&mut buf, Self::page_offset(id))?;
+        if !crc::page_is_intact(&buf, HEAP_CRC_OFFSET) && !lock(&self.replay_pages).contains(&id) {
+            return Err(format!("corrupt heap page {id}: checksum mismatch").into());
+        }
         Ok(HeapPage { data: buf })
     }
 
@@ -308,8 +473,8 @@ impl Heap {
                 self.wal.flush_up_to(lsn)?;
             }
             let data = page.data;
-            self.heap_file.write_all_at(&data, Self::page_offset(id))?;
-            self.heap_file.sync_data()?;
+            self.write_sealed(id, &data)?;
+            self.poisoning(self.heap_file.sync())?;
             self.pool.clear_dirty_single(id);
         }
         Ok(())
@@ -324,16 +489,16 @@ impl Heap {
                     self.wal.flush_up_to(lsn)?;
                 }
                 let data = page.data;
-                self.heap_file.write_all_at(&data, Self::page_offset(id))?;
+                self.write_sealed(id, &data)?;
             }
         }
-        self.heap_file.sync_data()?;
+        self.poisoning(self.heap_file.sync())?;
         self.pool.clear_dirty();
         Ok(())
     }
 
     pub fn sync_data(&self) -> Result<(), Box<dyn Error>> {
-        self.heap_file.sync_data()?;
+        self.poisoning(self.heap_file.sync())?;
         Ok(())
     }
 
@@ -346,7 +511,9 @@ impl Heap {
 
     fn find_tail_id(&self, id: u64) -> Result<u64, Box<dyn Error>> {
         let mut cur_id = id;
+        let mut steps = 0;
         loop {
+            self.check_chain_step(&mut steps, cur_id)?;
             let hdr = {
                 let page = self.fetch(cur_id)?;
                 page.header()?
@@ -363,7 +530,9 @@ impl Heap {
     pub fn free_chain(&self, primary_id: u64) -> Result<Vec<u64>, Box<dyn Error>> {
         let mut chain = vec![primary_id];
         let mut cur_id = primary_id;
+        let mut steps = 0;
         loop {
+            self.check_chain_step(&mut steps, cur_id)?;
             let hdr = {
                 let page = self.fetch(cur_id)?;
                 page.header()?

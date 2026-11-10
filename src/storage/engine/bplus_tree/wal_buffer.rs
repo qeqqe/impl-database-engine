@@ -24,7 +24,10 @@ pub(crate) struct WalBuffer {
     // `buffer[0..x_off - offset[0].1]`
     pub(super) offsets: Vec<(u64, usize)>,
     pub(super) max_frames: usize,
+    pub(super) max_bytes: usize,
 }
+
+pub(crate) const WAL_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 impl WalBuffer {
     pub fn new(max_frames: usize) -> Self {
@@ -32,11 +35,12 @@ impl WalBuffer {
             buffer: Vec::new(),
             offsets: Vec::new(),
             max_frames,
+            max_bytes: WAL_BUFFER_BYTES,
         }
     }
 
     pub fn is_full(&self) -> bool {
-        self.offsets.len() >= self.max_frames
+        self.offsets.len() >= self.max_frames || self.buffer.len() >= self.max_bytes
     }
 
     pub fn insert(&mut self, buf: &[u8], lsn: u64, rec_offset: usize) {

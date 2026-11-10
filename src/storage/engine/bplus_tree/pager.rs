@@ -1,16 +1,33 @@
-use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashSet, error::Error, path::PathBuf, sync::Arc};
 
 use super::{
-    heap::Heap,
+    header::HeapHeader,
+    heap::{
+        CHAIN_SLOT, Heap, MAX_BLOB_BYTES, MAX_RECORD_SIZE, SHARED_MAX_BLOB, SLOT_SIZE, decode_blob,
+        encode_blob, pack_ptr, unpack_ptr,
+    },
     index::Index,
-    slotted_page::Cell,
-    wal::{DirtyPageEntry, RecordType, UpdatePayload, Wal, sync_parent_dir},
+    io::{OsVfs, Vfs},
+    slotted_page::{Cell, HeapPage},
+    wal::{DirtyPageEntry, RecordType, UpdatePayload, Wal},
 };
+
+const MIN_CACHE_PAGES: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeOptions {
+    pub index_cache_pages: usize,
+    pub heap_cache_pages: usize,
+}
+
+impl Default for TreeOptions {
+    fn default() -> Self {
+        Self {
+            index_cache_pages: 10_000,
+            heap_cache_pages: 10_000,
+        }
+    }
+}
 
 pub struct RecoveryReport {
     pub checkpoint_lsn: u64,
@@ -27,7 +44,7 @@ pub(super) struct Pager {
 
 impl Pager {
     pub fn new(index_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let wal_path = index_path.with_file_name("wal_file.db");
+        let wal_path = index_path.with_extension("wal");
         Self::new_with_wal(index_path, heap_path, wal_path)
     }
 
@@ -36,26 +53,52 @@ impl Pager {
         heap_path: PathBuf,
         wal_path: PathBuf,
     ) -> Result<Self, Box<dyn Error>> {
-        let heap_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&heap_path)?;
+        Self::open_in(
+            &OsVfs,
+            index_path,
+            heap_path,
+            wal_path,
+            TreeOptions::default(),
+        )
+    }
 
-        let index_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&index_path)?;
+    pub fn open_in(
+        vfs: &dyn Vfs,
+        index_path: PathBuf,
+        heap_path: PathBuf,
+        wal_path: PathBuf,
+        options: TreeOptions,
+    ) -> Result<Self, Box<dyn Error>> {
+        let heap_file = vfs.open(&heap_path)?;
+        let index_file = vfs.open(&index_path)?;
 
-        sync_parent_dir(&heap_path)?;
-        sync_parent_dir(&index_path)?;
+        vfs.sync_parent(&heap_path)?;
+        vfs.sync_parent(&index_path)?;
 
-        let wal = Arc::new(Wal::new(wal_path)?);
-        let heap = Heap::new(heap_file, heap_path, Arc::clone(&wal));
-        let index = Index::new(index_file, index_path, Arc::clone(&wal));
+        let wal = Arc::new(Wal::open_in(vfs, wal_path)?);
+        let heap = Heap::new_with_capacity(
+            heap_file,
+            heap_path,
+            Arc::clone(&wal),
+            options.heap_cache_pages.max(MIN_CACHE_PAGES),
+        )?;
+        let index = Index::new_with_capacity(
+            index_file,
+            index_path,
+            Arc::clone(&wal),
+            options.index_cache_pages.max(MIN_CACHE_PAGES),
+        )?;
+
+        for record in wal.read_all_records()? {
+            let header = &record.header;
+            if record.is_full_image() {
+                if header.is_index {
+                    index.expect_replay([header.page_id]);
+                } else {
+                    heap.expect_replay([header.page_id]);
+                }
+            }
+        }
 
         Ok(Pager { index, heap, wal })
     }
@@ -65,11 +108,119 @@ impl Pager {
         cell: &Cell,
         data_record: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
-        if let Some(ref heap_ptr) = cell.h_ptr {
-            self.heap.get_record(heap_ptr.index, data_record)?;
-            Ok(())
+        match cell.h_ptr {
+            Some(ref heap_ptr) => self.load_records(heap_ptr.index, data_record),
+            None => Err("Couldn't find the header pointer".into()),
+        }
+    }
+
+    fn write_heap_page(&self, txn_id: u64, id: u64, page: &HeapPage) -> Result<(), Box<dyn Error>> {
+        let mut guard = self.heap.fetch_mut(id)?;
+        let old = guard.data;
+        self.log_heap_diff(txn_id, id, &old, &page.data)?;
+        guard.data = page.data;
+        Ok(())
+    }
+
+    pub fn check_records(records: &[Vec<u8>]) -> Result<(), Box<dyn Error>> {
+        let len = super::heap::encoded_blob_len(records);
+        if len > MAX_BLOB_BYTES {
+            return Err(
+                format!("records of {len} bytes exceed the {MAX_BLOB_BYTES} byte limit").into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn store_records(&self, txn_id: u64, records: Vec<Vec<u8>>) -> Result<u64, Box<dyn Error>> {
+        Self::check_records(&records)?;
+        let blob = encode_blob(&records);
+
+        if blob.len() <= SHARED_MAX_BLOB {
+            let needed = blob.len() + SLOT_SIZE;
+            let (id, current) = match self.heap.find_shared_page(needed) {
+                Some(id) => (id, Some(self.heap.fetch(id)?)),
+                None => (self.heap.allocate()?, None),
+            };
+            let slot = match &current {
+                Some(page) => page.free_shared_slot()?,
+                None => 0,
+            };
+            let mut page = match current {
+                Some(page) => page,
+                None => HeapPage::build_shared(id, &[])?,
+            };
+            if !page.put_shared(slot, &blob)? {
+                let mut slots = page.shared_slots()?;
+                match slots.get_mut(slot) {
+                    Some(entry) => *entry = Some(blob),
+                    None => slots.push(Some(blob)),
+                }
+                page = HeapPage::build_shared(id, &slots)?;
+            }
+            self.write_heap_page(txn_id, id, &page)?;
+            self.heap.note_shared_space(id, page.shared_free_space()?);
+            return Ok(pack_ptr(id, slot as u16));
+        }
+
+        let chunks: Vec<&[u8]> = blob.chunks(MAX_RECORD_SIZE).collect();
+        let ids = chunks
+            .iter()
+            .map(|_| self.heap.allocate())
+            .collect::<Result<Vec<u64>, _>>()?;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut header = if i == 0 {
+                HeapHeader::new_primary(ids[i])
+            } else {
+                HeapHeader::new_overflow(ids[i])
+            };
+            if let Some(next) = ids.get(i + 1) {
+                header.set_has_overflow(*next);
+            }
+            let mut page = HeapPage::empty(header);
+            page.add_cell(chunk.to_vec())?;
+            self.write_heap_page(txn_id, ids[i], &page)?;
+        }
+        Ok(pack_ptr(ids[0], CHAIN_SLOT))
+    }
+
+    pub fn load_records(&self, ptr: u64, out: &mut Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
+        let (id, slot) = unpack_ptr(ptr);
+        if slot == CHAIN_SLOT {
+            let mut chunks = Vec::new();
+            self.heap.get_record(id, &mut chunks)?;
+            out.extend(decode_blob(&chunks.concat())?);
         } else {
-            Err("Couldn't find the header pointer".into())
+            let records = self
+                .heap
+                .with_page(id, |page| -> Result<_, Box<dyn Error>> {
+                    let blob = page
+                        .shared_slot(slot as usize)?
+                        .ok_or_else(|| format!("dangling heap pointer to page {id} slot {slot}"))?;
+                    decode_blob(blob)
+                })??;
+            out.extend(records);
+        }
+        Ok(())
+    }
+
+    pub fn remove_records(&self, txn_id: u64, ptr: u64) -> Result<Vec<u64>, Box<dyn Error>> {
+        let (id, slot) = unpack_ptr(ptr);
+        if slot == CHAIN_SLOT {
+            return self.heap.free_chain(id);
+        }
+        let mut page = self.heap.fetch(id)?;
+        if page.shared_slot(slot as usize)?.is_none() {
+            return Err(format!("dangling heap pointer to page {id} slot {slot}").into());
+        }
+        page.clear_shared(slot as usize)?;
+        self.write_heap_page(txn_id, id, &page)?;
+        if page.shared_slot_count()? == 0 {
+            self.heap.forget_shared_page(id);
+            Ok(vec![id])
+        } else {
+            self.heap.note_shared_space(id, page.shared_free_space()?);
+            Ok(Vec::new())
         }
     }
 
@@ -157,18 +308,13 @@ impl Pager {
         old_data: &[u8],
         new_data: &[u8],
     ) -> Result<Option<u64>, Box<dyn Error>> {
-        if let Some((offset, start, end)) = Self::page_diff(old_data, new_data) {
-            let lsn = self.log_index_update(
-                txn_id,
-                page_id,
-                offset,
-                &old_data[start..end],
-                &new_data[start..end],
-            )?;
-            Ok(Some(lsn))
-        } else {
-            Ok(None)
+        let lsn = self
+            .wal
+            .log_page_change(txn_id, true, page_id, old_data, new_data)?;
+        if let Some(lsn) = lsn {
+            self.index.pool.logged_image(page_id, lsn, new_data);
         }
+        Ok(lsn)
     }
 
     pub fn log_heap_diff(
@@ -178,18 +324,13 @@ impl Pager {
         old_data: &[u8],
         new_data: &[u8],
     ) -> Result<Option<u64>, Box<dyn Error>> {
-        if let Some((offset, start, end)) = Self::page_diff(old_data, new_data) {
-            let lsn = self.log_heap_update(
-                txn_id,
-                page_id,
-                offset,
-                &old_data[start..end],
-                &new_data[start..end],
-            )?;
-            Ok(Some(lsn))
-        } else {
-            Ok(None)
+        let lsn = self
+            .wal
+            .log_page_change(txn_id, false, page_id, old_data, new_data)?;
+        if let Some(lsn) = lsn {
+            self.heap.pool.logged_image(page_id, lsn, new_data);
         }
+        Ok(lsn)
     }
 
     pub fn fuzzy_checkpoint(&self) -> Result<u64, Box<dyn Error>> {
@@ -219,145 +360,108 @@ impl Pager {
         Ok(checkpoint_lsn)
     }
 
+    fn apply_image(
+        &self,
+        is_index: bool,
+        page_id: u64,
+        offset: u16,
+        image: &[u8],
+        lsn: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let off = offset as usize;
+        let page_size = if is_index {
+            super::PAGE_SIZE
+        } else {
+            super::heap::PAGE_SIZE
+        };
+        if off + image.len() > page_size {
+            return Err(format!(
+                "corrupt WAL: image of {} bytes at offset {off} does not fit page {page_id}",
+                image.len()
+            )
+            .into());
+        }
+        if is_index {
+            self.index.ensure_page(page_id)?;
+            let mut page = self.index.fetch_mut(page_id)?;
+            page.data[off..off + image.len()].copy_from_slice(image);
+            drop(page);
+            self.index.pool.update_lsn(page_id, lsn);
+        } else {
+            self.heap.ensure_page(page_id)?;
+            let mut page = self.heap.fetch_mut(page_id)?;
+            page.data[off..off + image.len()].copy_from_slice(image);
+            drop(page);
+            self.heap.pool.update_lsn(page_id, lsn);
+        }
+        Ok(())
+    }
+
     pub fn recover(&self) -> Result<RecoveryReport, Box<dyn Error>> {
         let chk_lsn = self.wal.last_checkpoint_lsn();
-        let mut dpt: HashMap<(bool, u64), u64> = HashMap::new();
-        let mut att: HashMap<u64, u64> = HashMap::new();
-        let mut start_lsn = 0;
-
         let all_records = self.wal.read_all_records()?;
 
-        if chk_lsn > 0
-            && let Some(chk_record) = all_records.iter().find(|r| r.header.lsn == chk_lsn)
-            && let Some(chk_data) = chk_record.parse_checkpoint()
-        {
-            for entry in chk_data.dpt {
-                dpt.insert((entry.is_index, entry.page_id), entry.rec_lsn);
-            }
-            for entry in chk_data.att {
-                att.insert(entry.txn_id, entry.last_lsn);
-            }
-            start_lsn = chk_lsn + 1;
-        }
+        let mut loser_txns: HashSet<u64> = HashSet::new();
+        let mut redone_records = 0;
 
-        for record in all_records.iter().filter(|r| r.header.lsn >= start_lsn) {
-            match record.header.record_type {
+        for record in &all_records {
+            let header = &record.header;
+            match header.record_type {
                 RecordType::Begin => {
-                    att.insert(record.header.txn_id, record.header.lsn);
-                }
-                RecordType::Update => {
-                    if record.header.txn_id != 0 {
-                        att.insert(record.header.txn_id, record.header.lsn);
+                    if header.txn_id != 0 {
+                        loser_txns.insert(header.txn_id);
                     }
-                    dpt.entry((record.header.is_index, record.header.page_id))
-                        .or_insert(record.header.lsn);
+                }
+                RecordType::Update | RecordType::Clr => {
+                    if header.txn_id != 0 {
+                        loser_txns.insert(header.txn_id);
+                    }
+                    let (offset, _, redo) = record
+                        .parse_update()
+                        .ok_or("corrupt WAL: malformed update payload")?;
+                    self.apply_image(header.is_index, header.page_id, offset, redo, header.lsn)?;
+                    redone_records += 1;
                 }
                 RecordType::Commit | RecordType::Abort => {
-                    att.remove(&record.header.txn_id);
-                }
-                RecordType::Clr => {
-                    if record.header.txn_id != 0 {
-                        att.insert(record.header.txn_id, record.header.lsn);
-                    }
-                    dpt.entry((record.header.is_index, record.header.page_id))
-                        .or_insert(record.header.lsn);
+                    loser_txns.remove(&header.txn_id);
                 }
                 RecordType::Checkpoint => {}
             }
         }
 
-        let min_rec_lsn = if dpt.is_empty() {
-            chk_lsn
-        } else {
-            *dpt.values().min().unwrap()
-        };
-
-        let mut redone_records = 0;
-
-        for record in all_records.iter().filter(|r| r.header.lsn >= min_rec_lsn) {
-            if record.header.record_type != RecordType::Update
-                && record.header.record_type != RecordType::Clr
-            {
-                continue;
-            }
-
-            let page_key = (record.header.is_index, record.header.page_id);
-            if let Some(&rec_lsn) = dpt.get(&page_key)
-                && record.header.lsn >= rec_lsn
-                && let Some((offset, _, redo)) = record.parse_update()
-            {
-                let off = offset as usize;
-                if record.header.is_index {
-                    let page_id = record.header.page_id;
-                    let req_len = (page_id + 1) * super::PAGE_SIZE as u64;
-                    if self.index.index_file.metadata()?.len() < req_len {
-                        self.index.index_file.set_len(req_len)?;
-                    }
-                    if self.index.next_id.load(std::sync::atomic::Ordering::SeqCst) <= page_id {
-                        self.index
-                            .next_id
-                            .store(page_id + 1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    let mut page = self.index.fetch_mut(page_id);
-                    page.data[off..off + redo.len()].copy_from_slice(redo);
-                    drop(page);
-                    self.index.pool.update_lsn(page_id, record.header.lsn);
-                } else {
-                    let page_id = record.header.page_id;
-                    let req_len = (page_id + 1) * super::heap::PAGE_SIZE as u64;
-                    if self.heap.heap_file.metadata()?.len() < req_len {
-                        self.heap.heap_file.set_len(req_len)?;
-                    }
-                    if self.heap.next_id.load(std::sync::atomic::Ordering::SeqCst) <= page_id {
-                        self.heap
-                            .next_id
-                            .store(page_id + 1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    let mut page = self.heap.fetch_mut(page_id)?;
-                    page.data[off..off + redo.len()].copy_from_slice(redo);
-                    drop(page);
-                    self.heap.pool.update_lsn(page_id, record.header.lsn);
-                }
-                redone_records += 1;
-            }
-        }
-
-        let loser_txns: HashSet<u64> = att.keys().copied().filter(|&id| id != 0).collect();
         let mut undone_records = 0;
 
         if !loser_txns.is_empty() {
-            let backward_records = self.wal.read_records_backward()?;
-            for record in backward_records {
-                if loser_txns.contains(&record.header.txn_id)
-                    && record.header.record_type == RecordType::Update
-                    && let Some((offset, undo, _)) = record.parse_update()
+            for record in all_records.iter().rev() {
+                let header = &record.header;
+                if header.record_type != RecordType::Update || !loser_txns.contains(&header.txn_id)
                 {
-                    let off = offset as usize;
-                    if record.header.is_index {
-                        let mut page = self.index.fetch_mut(record.header.page_id);
-                        page.data[off..off + undo.len()].copy_from_slice(undo);
-                    } else {
-                        let mut page = self.heap.fetch_mut(record.header.page_id)?;
-                        page.data[off..off + undo.len()].copy_from_slice(undo);
-                    }
-
-                    self.wal.write_clr(
-                        record.header.txn_id,
-                        record.header.is_index,
-                        record.header.page_id,
-                        offset,
-                        undo,
-                    )?;
-                    undone_records += 1;
+                    continue;
                 }
+                let (offset, undo, _) = record
+                    .parse_update()
+                    .ok_or("corrupt WAL: malformed update payload")?;
+                let clr_lsn = self.wal.write_clr(
+                    header.txn_id,
+                    header.is_index,
+                    header.page_id,
+                    offset,
+                    undo,
+                )?;
+                self.apply_image(header.is_index, header.page_id, offset, undo, clr_lsn)?;
+                undone_records += 1;
             }
 
-            for &txn_id in &loser_txns {
+            let mut losers: Vec<u64> = loser_txns.iter().copied().collect();
+            losers.sort_unstable();
+            for txn_id in losers {
                 self.wal.abort_transaction(txn_id)?;
             }
         }
 
         self.wal.flush_all()?;
+        self.index.end_replay();
+        self.heap.end_replay();
 
         let mut active_list: Vec<u64> = loser_txns.into_iter().collect();
         active_list.sort_unstable();
