@@ -17,11 +17,12 @@ pub mod value;
 use crate::{
     planner::{
         binder::Binder,
-        catalog::Catalog,
+        catalog::{Catalog, TableSchema},
         error::{PlanError, PlanResult},
         logical::Plan,
         optimizer::Optimizer,
         physical::{PhysicalPlan, PhysicalPlanner},
+        physical_expr::PhysExpr,
     },
     sql::{Parser, Statement},
 };
@@ -29,6 +30,14 @@ use crate::{
 pub fn plan_statement(catalog: &Catalog, statement: &Statement) -> PlanResult<Plan> {
     let plan = Binder::new(catalog).bind(statement)?;
     Optimizer::default().optimize_plan(plan)
+}
+
+pub fn bind_checks(catalog: &Catalog, table: &TableSchema) -> PlanResult<Vec<PhysExpr>> {
+    let (schema, checks) = Binder::new(catalog).bind_checks(table)?;
+    checks
+        .iter()
+        .map(|check| PhysExpr::lower(check, &schema))
+        .collect()
 }
 
 pub fn plan_sql(catalog: &Catalog, sql: &str) -> PlanResult<Plan> {
