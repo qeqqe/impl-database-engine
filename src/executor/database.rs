@@ -9,24 +9,31 @@ use std::{
 };
 
 use crate::{
+    execution::{
+        analyze::{analyze_query, render_analyzed},
+        execute_query,
+    },
     executor::{
         codec::encode_row,
         ddl::{CatalogEntry, parse_catalog_entry, resolve_index},
         error::{DbError, DbResult},
         keys::{
             CATALOG_TABLE, FIRST_USER_TABLE, ObjectId, TableId, encode_row_key, index_key,
-            index_prefix, row_bits, table_bounds, tree_key,
+            index_prefix, key_range_bounds, prefix_bounds, row_bits, table_bounds, tree_key,
         },
         lock::LockManager,
         result::StatementResult,
         session::Session,
-        source::{CatalogState, column_types},
+        source::{CatalogState, StorageSource, column_types, decode_records},
     },
     planner::{
         bind_checks,
         catalog::{Catalog, IndexDef, TableSchema},
-        logical::Plan,
+        error::PlanError,
+        logical::{LogicalPlan, Plan},
+        physical::{PhysicalPlan, PhysicalPlanner},
         physical_expr::PhysExpr,
+        subquery::{SubqueryKind, resolve_assignments, resolve_plan},
         types::DataType,
         value::{Row, Value},
     },
@@ -503,11 +510,214 @@ impl Database {
 
 impl<S: Deref<Target = CatalogState>> Ctx<'_, S> {
     pub(super) fn run_read(&self, plan: Plan, txn: u64) -> DbResult<StatementResult> {
-        todo!()
+        let plan = self.resolve_statement(plan, txn)?;
+        match plan {
+            Plan::Query(logical) => {
+                let physical = self.physical(&logical)?;
+                let rows = execute_query(&physical, &self.source(txn))?;
+                Ok(StatementResult::Rows {
+                    columns: physical.schema().column_names(),
+                    rows,
+                })
+            }
+            Plan::ShowTables => Ok(StatementResult::Rows {
+                columns: vec!["table".into()],
+                rows: self
+                    .state
+                    .catalog
+                    .table_names()
+                    .into_iter()
+                    .map(|name| vec![Value::from(name)])
+                    .collect(),
+            }),
+            Plan::Describe(name) => self.describe(&name),
+            Plan::Explain { analyze, plan } => self.explain_plan(*plan, analyze, txn),
+            _ => Err(DbError::Internal(
+                "a writing statement reached the read path".into(),
+            )),
+        }
     }
 
     pub(super) fn explain_query(&self, plan: Plan, txn: u64) -> DbResult<String> {
-        todo!()
+        match plan {
+            Plan::Query(logical) => {
+                let logical = self.resolve(logical, txn)?;
+                Ok(self.physical(&logical)?.to_string())
+            }
+            _ => Err(PlanError::Unsupported("only queries can be explained".to_string()).into()),
+        }
+    }
+
+    fn source(&self, txn: u64) -> StorageSource<'_> {
+        StorageSource {
+            tree: self.tree,
+            state: &self.state,
+            txn,
+        }
+    }
+
+    fn physical(&self, logical: &LogicalPlan) -> DbResult<PhysicalPlan> {
+        Ok(PhysicalPlanner::new(&self.state.catalog).plan(logical)?)
+    }
+
+    fn subquery_rows(&self, plan: &LogicalPlan, txn: u64) -> DbResult<Vec<Row>> {
+        let physical = self.physical(plan)?;
+        Ok(execute_query(&physical, &self.source(txn))?)
+    }
+
+    fn resolve(&self, plan: LogicalPlan, txn: u64) -> DbResult<LogicalPlan> {
+        resolve_plan(plan, &mut |_, inner| self.subquery_rows(&inner, txn))
+    }
+
+    fn resolve_statement(&self, plan: Plan, txn: u64) -> DbResult<Plan> {
+        let mut run = |_: SubqueryKind, inner: LogicalPlan| self.subquery_rows(&inner, txn);
+        self.resolve_statement_with(plan, &mut run)
+    }
+
+    fn resolve_statement_with<F>(&self, plan: Plan, run: &mut F) -> DbResult<Plan>
+    where
+        F: FnMut(SubqueryKind, LogicalPlan) -> DbResult<Vec<Row>>,
+    {
+        Ok(match plan {
+            Plan::Query(logical) => Plan::Query(resolve_plan(logical, run)?),
+            Plan::Insert { table, input } => Plan::Insert {
+                table,
+                input: resolve_plan(input, run)?,
+            },
+            Plan::Update {
+                table,
+                input,
+                assignments,
+            } => Plan::Update {
+                table,
+                input: resolve_plan(input, run)?,
+                assignments: resolve_assignments(assignments, run)?,
+            },
+            Plan::Delete { table, input } => Plan::Delete {
+                table,
+                input: resolve_plan(input, run)?,
+            },
+            other => other,
+        })
+    }
+
+    fn explained_subqueries(
+        &self,
+        plan: Plan,
+        analyze: bool,
+        txn: u64,
+    ) -> DbResult<(Plan, Vec<String>)> {
+        let mut sections = Vec::new();
+        let mut count = 0;
+        let mut run = |kind: SubqueryKind, inner: LogicalPlan| -> DbResult<Vec<Row>> {
+            count += 1;
+            sections.push(format!("Subquery {count} ({kind}):"));
+            let physical = self.physical(&inner)?;
+            let (lines, rows) = if analyze {
+                let analyzed = analyze_query(&physical, &self.source(txn))?;
+                (render_analyzed(&physical, &analyzed, true), analyzed.rows)
+            } else {
+                let rows = execute_query(&physical, &self.source(txn))?;
+                let lines = physical.to_string().lines().map(String::from).collect();
+                (lines, rows)
+            };
+            sections.extend(lines.into_iter().map(|line| format!("  {line}")));
+            Ok(rows)
+        };
+        let plan = self.resolve_statement_with(plan, &mut run)?;
+        Ok((plan, sections))
+    }
+
+    fn explain_plan(&self, plan: Plan, analyze: bool, txn: u64) -> DbResult<StatementResult> {
+        let (plan, sections) = self.explained_subqueries(plan, analyze, txn)?;
+        let mut lines: Vec<String> = match (plan, analyze) {
+            (Plan::Query(logical), false) => self
+                .physical(&logical)?
+                .to_string()
+                .lines()
+                .map(String::from)
+                .collect(),
+            (Plan::Query(logical), true) => {
+                let physical = self.physical(&logical)?;
+                let analyzed = analyze_query(&physical, &self.source(txn))?;
+                render_analyzed(&physical, &analyzed, true)
+            }
+            (Plan::Insert { table, input }, false) => {
+                self.explain_dml(format!("Insert: {table}"), &input)?
+            }
+            (
+                Plan::Update {
+                    table,
+                    input,
+                    assignments,
+                },
+                false,
+            ) => {
+                let schema = self.state.catalog.get_table(&table)?;
+                let set = assignments
+                    .iter()
+                    .map(|a| format!("{} = {}", schema.columns[a.column].name, a.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.explain_dml(format!("Update: {table} set {set}"), &input)?
+            }
+            (Plan::Delete { table, input }, false) => {
+                self.explain_dml(format!("Delete: {table}"), &input)?
+            }
+            _ => {
+                return Err(DbError::Internal(
+                    "EXPLAIN reached execution with a plan the binder rejects".into(),
+                ));
+            }
+        };
+        lines.extend(sections);
+        Ok(StatementResult::Rows {
+            columns: vec!["plan".into()],
+            rows: lines
+                .into_iter()
+                .map(|line| vec![Value::from(line)])
+                .collect(),
+        })
+    }
+
+    fn explain_dml(&self, header: String, input: &LogicalPlan) -> DbResult<Vec<String>> {
+        let physical = self.physical(input)?;
+        Ok(std::iter::once(header)
+            .chain(physical.to_string().lines().map(|line| format!("  {line}")))
+            .collect())
+    }
+
+    fn describe(&self, name: &str) -> DbResult<StatementResult> {
+        let schema = self.state.catalog.get_table(name)?;
+        let rows = schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| {
+                let key = if schema.primary_key.contains(&i) {
+                    "PRIMARY"
+                } else if schema.unique_keys.iter().any(|k| k.contains(&i)) {
+                    "UNIQUE"
+                } else {
+                    ""
+                };
+                vec![
+                    Value::from(column.name.as_str()),
+                    Value::from(schema.column_type(i).to_string()),
+                    Value::Boolean(schema.is_nullable(i)),
+                    Value::from(key),
+                    column
+                        .default_value()
+                        .map_or(Value::Null, |d| Value::from(d.to_string())),
+                ]
+            })
+            .collect();
+        Ok(StatementResult::Rows {
+            columns: ["column", "type", "nullable", "key", "default"]
+                .map(String::from)
+                .to_vec(),
+            rows,
+        })
     }
 }
 

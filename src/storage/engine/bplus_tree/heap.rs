@@ -5,8 +5,6 @@
 //! b+ trees's disk persisted index file and will map the corresponding data
 //! record in heap through the slotted page's cell Header Pointer.
 
-// TODO: implement overflow pages cus they are bound to exist
-
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::ops::{Deref, DerefMut};
