@@ -4,5 +4,6 @@ pub mod ddl;
 pub mod error;
 pub mod keys;
 pub mod lock;
+pub mod result;
 pub mod session;
 pub mod source;

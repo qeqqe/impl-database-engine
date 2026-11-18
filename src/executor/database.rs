@@ -11,12 +11,14 @@ use std::{
 use crate::{
     executor::{
         codec::encode_row,
+        ddl::{CatalogEntry, parse_catalog_entry, resolve_index},
         error::{DbError, DbResult},
         keys::{
             CATALOG_TABLE, FIRST_USER_TABLE, ObjectId, TableId, encode_row_key, index_key,
             index_prefix, row_bits, table_bounds, tree_key,
         },
         lock::LockManager,
+        result::StatementResult,
         session::Session,
         source::{CatalogState, column_types},
     },
@@ -28,9 +30,10 @@ use crate::{
         types::DataType,
         value::{Row, Value},
     },
+    sql::Statement,
     storage::engine::bplus_tree::{
         BplusTree, Key, TreeOptions,
-        io::{DirLock, Vfs},
+        io::{DirLock, OsVfs, Vfs},
     },
 };
 
@@ -47,9 +50,20 @@ pub struct DbConfig {
     pub heap_cache_pages: usize,
 }
 
+impl Default for DbConfig {
+    fn default() -> Self {
+        let tree = TreeOptions::default();
+        Self {
+            vfs: OsVfs::shared(),
+            index_cache_pages: tree.index_cache_pages,
+            heap_cache_pages: tree.heap_cache_pages,
+        }
+    }
+}
+
 pub(super) struct Engine {
     pub(super) tree: BplusTree,
-    pub(super) lock: LockManager,
+    pub(super) locks: LockManager,
     catalog: RwLock<Arc<CatalogState>>,
     row_ids: Mutex<HashMap<TableId, u64>>,
     next_txn_id: AtomicU64,
@@ -206,7 +220,73 @@ fn unique_key(cols: &[usize], row: &[Value]) -> Option<Vec<Value>> {
 
 impl Engine {
     fn open(dir: &Path, config: DbConfig) -> DbResult<Self> {
-        todo!()
+        let vfs = config.vfs;
+        vfs.create_dir_all(dir).map_err(DbError::storage)?;
+        let lock = lock_directory(vfs.as_ref(), dir)?;
+        check_format(vfs.as_ref(), dir)?;
+        let tree = BplusTree::open_in(
+            vfs.as_ref(),
+            dir.join("data.idx"),
+            dir.join("data.heap"),
+            dir.join("data.wal"),
+            TreeOptions {
+                index_cache_pages: config.index_cache_pages,
+                heap_cache_pages: config.heap_cache_pages,
+            },
+        )
+        .map_err(DbError::storage)?;
+        tree.recover().map_err(DbError::storage)?;
+
+        let mut state = CatalogState {
+            next_table_id: FIRST_USER_TABLE,
+            ..CatalogState::default()
+        };
+        let (low, high) = table_bounds(CATALOG_TABLE);
+        let mut pending_indexes = Vec::new();
+        for entry in tree.range(READ_ONLY_TXN, low, high) {
+            let (key, records) = entry.map_err(DbError::storage)?;
+            let id = TableId::try_from(row_bits(key))
+                .map_err(|_| DbError::Corrupt(format!("catalog key {key} is not a table id")))?;
+            let [ddl] = records.as_slice() else {
+                return Err(DbError::Corrupt(format!(
+                    "catalog entry {id} has {} records",
+                    records.len()
+                )));
+            };
+            let sql = std::str::from_utf8(ddl)
+                .map_err(|_| DbError::Corrupt(format!("catalog entry {id} is not UTF-8")))?;
+            match parse_catalog_entry(sql)? {
+                CatalogEntry::Table(schema) => {
+                    state.table_ids.insert(schema.name.to_lowercase(), id);
+                    state.catalog.create_table(schema)?;
+                }
+                CatalogEntry::Index(create) => pending_indexes.push((id, create)),
+            }
+            state.next_table_id = state.next_table_id.max(id.saturating_add(1));
+        }
+        for (id, create) in pending_indexes {
+            let schema = state.catalog.get_table(&create.table).map_err(|_| {
+                DbError::Corrupt(format!(
+                    "index {} belongs to table {}, which does not exist",
+                    create.name, create.table
+                ))
+            })?;
+            let index = resolve_index(&create, schema)?;
+            state.index_ids.insert(index.name.to_lowercase(), id);
+            state.catalog.create_index(index)?;
+        }
+        tree.checkpoint_and_truncate().map_err(DbError::storage)?;
+
+        Ok(Self {
+            tree,
+            locks: super::lock::LockManager::new(),
+            catalog: RwLock::new(Arc::new(state)),
+            row_ids: Mutex::new(HashMap::new()),
+            next_txn_id: AtomicU64::new(1),
+            next_session_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            _lock: lock,
+        })
     }
 
     pub(super) fn committed(&self) -> Arc<CatalogState> {
@@ -342,4 +422,97 @@ fn has_data(vfs: &dyn Vfs, dir: &Path) -> DbResult<bool> {
         }
     }
     Ok(false)
+}
+
+impl Database {
+    pub fn open(dir: impl AsRef<Path>) -> DbResult<Self> {
+        Self::open_with_vfs(OsVfs::shared(), dir)
+    }
+
+    pub fn open_with_vfs(vfs: Arc<dyn Vfs>, dir: impl AsRef<Path>) -> DbResult<Self> {
+        Self::open_with(
+            dir,
+            DbConfig {
+                vfs,
+                ..DbConfig::default()
+            },
+        )
+    }
+
+    pub fn open_with(dir: impl AsRef<Path>, config: DbConfig) -> DbResult<Self> {
+        let engine = Arc::new(Engine::open(dir.as_ref(), config)?);
+        Ok(Self {
+            session: Session::new(engine),
+        })
+    }
+
+    pub fn session(&self) -> Session {
+        Session::new(self.session.engine().clone())
+    }
+
+    pub fn default_session(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        self.session.catalog()
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.session.in_transaction()
+    }
+
+    pub fn execute(&mut self, sql: &str) -> DbResult<StatementResult> {
+        self.session.execute(sql)
+    }
+
+    pub fn explain(&self, sql: &str) -> DbResult<String> {
+        self.session.explain(sql)
+    }
+
+    pub fn execute_script(&mut self, sql: &str) -> DbResult<Vec<StatementResult>> {
+        self.session.execute_script(sql)
+    }
+
+    pub fn execute_statement(&mut self, statement: &Statement) -> DbResult<StatementResult> {
+        self.session.execute_statement(statement)
+    }
+
+    pub fn checkpoint(&mut self) -> DbResult<()> {
+        self.session.checkpoint()
+    }
+
+    pub fn wal_size_bytes(&self) -> DbResult<u64> {
+        self.session.wal_size_bytes()
+    }
+
+    pub fn close(mut self) -> DbResult<()> {
+        self.session.end()?;
+        let engine = self.session.engine();
+        let others = Arc::strong_count(engine) - 1;
+        if others > 0 {
+            return Err(DbError::SessionsOpen(others));
+        }
+        engine.shutdown()
+    }
+
+    pub fn crash(self) {
+        self.session.engine().crash();
+    }
+}
+
+impl<S: Deref<Target = CatalogState>> Ctx<'_, S> {
+    pub(super) fn run_read(&self, plan: Plan, txn: u64) -> DbResult<StatementResult> {
+        todo!()
+    }
+
+    pub(super) fn explain_query(&self, plan: Plan, txn: u64) -> DbResult<String> {
+        todo!()
+    }
+}
+
+impl Ctx<'_, Writer<'_>> {
+    pub(super) fn run(&mut self, plan: Plan, txn: u64) -> DbResult<StatementResult> {
+        todo!()
+    }
 }
