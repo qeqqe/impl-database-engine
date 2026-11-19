@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
+    collections::{HashMap, HashSet},
+    ops::{Bound, Deref, DerefMut},
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock,
@@ -15,11 +15,15 @@ use crate::{
     },
     executor::{
         codec::encode_row,
-        ddl::{CatalogEntry, parse_catalog_entry, resolve_index},
+        ddl::{
+            CatalogEntry, parse_catalog_entry, render_create_index, render_create_table,
+            resolve_index,
+        },
         error::{DbError, DbResult},
         keys::{
-            CATALOG_TABLE, FIRST_USER_TABLE, ObjectId, TableId, encode_row_key, index_key,
-            index_prefix, key_range_bounds, prefix_bounds, row_bits, table_bounds, tree_key,
+            CATALOG_TABLE, FIRST_USER_TABLE, MAX_HIDDEN_ROW_ID, ObjectId, TableId, encode_row_key,
+            index_key, index_prefix, key_range_bounds, object_bounds, prefix_bounds, row_bits,
+            table_bounds, tree_key,
         },
         lock::LockManager,
         result::StatementResult,
@@ -30,9 +34,10 @@ use crate::{
         bind_checks,
         catalog::{Catalog, IndexDef, TableSchema},
         error::PlanError,
-        logical::{LogicalPlan, Plan},
+        logical::{AlterAction, LogicalPlan, Plan, UpdateAssignment},
         physical::{PhysicalPlan, PhysicalPlanner},
         physical_expr::PhysExpr,
+        schema::Schema,
         subquery::{SubqueryKind, resolve_assignments, resolve_plan},
         types::DataType,
         value::{Row, Value},
@@ -719,10 +724,574 @@ impl<S: Deref<Target = CatalogState>> Ctx<'_, S> {
             rows,
         })
     }
+
+    fn table_info(&self, name: &str) -> DbResult<TableInfo> {
+        let (id, schema) = self
+            .state
+            .table(name)
+            .ok_or_else(|| DbError::Internal(format!("table {name} has no storage id")))?;
+        let indexes = self
+            .state
+            .catalog
+            .indexes_on(name)
+            .into_iter()
+            .map(|def| {
+                let id = self.state.index_id(&def.name).ok_or_else(|| {
+                    DbError::Internal(format!("index {} has no storage id", def.name))
+                })?;
+                Ok(IndexInfo {
+                    id,
+                    def: def.clone(),
+                })
+            })
+            .collect::<DbResult<_>>()?;
+        TableInfo::new(&self.state.catalog, id, schema.clone(), indexes)
+    }
+
+    fn check_unique(&self, info: &TableInfo, row: &[Value], txn: u64) -> DbResult<()> {
+        for index in info.indexes.iter().filter(|i| i.def.unique) {
+            self.probe_unique(info, index, row, txn)?;
+        }
+        Ok(())
+    }
+
+    fn probe_unique(
+        &self,
+        info: &TableInfo,
+        index: &IndexInfo,
+        row: &[Value],
+        txn: u64,
+    ) -> DbResult<()> {
+        let cols = &index.def.columns;
+        let Some(wanted) = unique_key(cols, row) else {
+            return Ok(());
+        };
+        let Some(prefix) = index_prefix(info.types[cols[0]], &row[cols[0]]) else {
+            return Ok(());
+        };
+        let types = info.index_types(index);
+        let positions: Vec<usize> = (0..cols.len()).collect();
+        let (low, high) = prefix_bounds(index.id, prefix, prefix);
+        for entry in self.tree.range(txn, low, high) {
+            let (_, records) = entry.map_err(DbError::storage)?;
+            let other = decode_records(&types, &records)?;
+            if unique_key(&positions, &other).as_ref() == Some(&wanted) {
+                return Err(DbError::UniqueViolation {
+                    table: info.schema.name.clone(),
+                    columns: cols
+                        .iter()
+                        .map(|&c| info.schema.columns[c].name.clone())
+                        .collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn targets(
+        &self,
+        info: &TableInfo,
+        plan: &PhysicalPlan,
+        txn: u64,
+    ) -> DbResult<Vec<(Key, Row)>> {
+        let full_row = |projection: &[usize]| {
+            if projection.iter().copied().eq(0..info.types.len()) {
+                Ok(())
+            } else {
+                Err(DbError::Internal(
+                    "DML input does not scan full rows".into(),
+                ))
+            }
+        };
+        let source = self.source(txn);
+        match plan {
+            PhysicalPlan::Values { rows, .. } if rows.is_empty() => Ok(Vec::new()),
+            PhysicalPlan::SeqScan { projection, .. } => {
+                full_row(projection)?;
+                source.keyed_rows(&info.types, table_bounds(info.id))
+            }
+            PhysicalPlan::IndexScan {
+                projection, range, ..
+            } => {
+                full_row(projection)?;
+                match key_range_bounds(info.id, range) {
+                    Some(bounds) => source.keyed_rows(&info.types, bounds),
+                    None => Ok(Vec::new()),
+                }
+            }
+            PhysicalPlan::IndexLookup {
+                projection,
+                index,
+                ranges,
+                ..
+            } => {
+                full_row(projection)?;
+                let found = info
+                    .indexes
+                    .iter()
+                    .find(|i| i.def.name.eq_ignore_ascii_case(index))
+                    .ok_or_else(|| DbError::Internal(format!("index {index} has no storage id")))?;
+                source.looked_up_rows(info.id, &info.types, &found.def, found.id, ranges)
+            }
+            PhysicalPlan::Filter { input, predicate } => {
+                let mut rows = self.targets(info, input, txn)?;
+                let mut kept = Vec::with_capacity(rows.len());
+                for (key, row) in rows.drain(..) {
+                    if predicate.eval_predicate(&row)? {
+                        kept.push((key, row));
+                    }
+                }
+                Ok(kept)
+            }
+            other => Err(DbError::Internal(format!(
+                "unexpected DML input plan:\n{other}"
+            ))),
+        }
+    }
 }
 
 impl Ctx<'_, Writer<'_>> {
     pub(super) fn run(&mut self, plan: Plan, txn: u64) -> DbResult<StatementResult> {
-        todo!()
+        if is_read_only(&plan) {
+            return self.run_read(plan, txn);
+        }
+        let plan = self.resolve_statement(plan, txn)?;
+        match plan {
+            Plan::Insert { table, input } => self.insert(&table, &input, txn),
+            Plan::Update {
+                table,
+                input,
+                assignments,
+            } => self.update(&table, &input, &assignments, txn),
+            Plan::Delete { table, input } => self.delete(&table, &input, txn),
+            Plan::CreateTable {
+                schema,
+                if_not_exists,
+            } => self.create_table(schema, if_not_exists, txn),
+            Plan::DropTable { name, if_exists } => self.drop_table(&name, if_exists, txn),
+            Plan::CreateIndex {
+                index,
+                if_not_exists,
+            } => self.create_index(index, if_not_exists, txn),
+            Plan::DropIndex { name, if_exists } => self.drop_index(&name, if_exists, txn),
+            Plan::AlterTable { table, action } => self.alter_table(&table, action, txn),
+            Plan::Query(_) | Plan::ShowTables | Plan::Describe(_) | Plan::Explain { .. } => Err(
+                DbError::Internal("a reading statement reached the write path".into()),
+            ),
+            Plan::Begin(_) | Plan::Commit | Plan::Rollback => Err(DbError::Internal(
+                "transaction control reached statement execution".into(),
+            )),
+        }
+    }
+
+    fn allocate_object_id(&mut self) -> DbResult<ObjectId> {
+        let id = self.state.next_table_id;
+        if id == ObjectId::MAX {
+            return Err(DbError::TooManyTables);
+        }
+        self.state.next_table_id = id + 1;
+        Ok(id)
+    }
+
+    fn delete_range(&self, bounds: (Bound<Key>, Bound<Key>), txn: u64) -> DbResult<()> {
+        let keys: Vec<Key> = self
+            .tree
+            .range(txn, bounds.0, bounds.1)
+            .map(|entry| entry.map(|(key, _)| key).map_err(DbError::storage))
+            .collect::<DbResult<_>>()?;
+        for key in keys {
+            self.tree.delete(txn, key).map_err(DbError::storage)?;
+        }
+        Ok(())
+    }
+
+    fn create_table(
+        &mut self,
+        schema: TableSchema,
+        if_not_exists: bool,
+        txn: u64,
+    ) -> DbResult<StatementResult> {
+        if self.state.catalog.has_table(&schema.name) {
+            return if if_not_exists {
+                Ok(StatementResult::Done("CREATE TABLE"))
+            } else {
+                Err(PlanError::TableAlreadyExists(schema.name).into())
+            };
+        }
+        let id = self.allocate_object_id()?;
+        let ddl = render_create_table(&schema);
+        self.tree
+            .insert(
+                txn,
+                tree_key(CATALOG_TABLE, id as u64),
+                vec![ddl.into_bytes()],
+            )
+            .map_err(DbError::storage)?;
+
+        self.state.table_ids.insert(schema.name.to_lowercase(), id);
+        let automatic = schema.automatic_indexes();
+        self.state.catalog.create_table(schema)?;
+        for index in automatic {
+            self.add_index(index, txn)?;
+        }
+        Ok(StatementResult::Done("CREATE TABLE"))
+    }
+
+    fn create_index(
+        &mut self,
+        index: IndexDef,
+        if_not_exists: bool,
+        txn: u64,
+    ) -> DbResult<StatementResult> {
+        if self.state.catalog.has_index(&index.name) {
+            return if if_not_exists {
+                Ok(StatementResult::Done("CREATE INDEX"))
+            } else {
+                Err(PlanError::IndexAlreadyExists(index.name).into())
+            };
+        }
+        self.add_index(index, txn)?;
+        Ok(StatementResult::Done("CREATE INDEX"))
+    }
+
+    fn add_index(&mut self, index: IndexDef, txn: u64) -> DbResult<()> {
+        let schema = self.state.catalog.get_table(&index.table)?;
+        let ddl = render_create_index(&index, schema);
+        let table = index.table.clone();
+        let name = index.name.clone();
+        let id = self.allocate_object_id()?;
+        self.tree
+            .insert(
+                txn,
+                tree_key(CATALOG_TABLE, id as u64),
+                vec![ddl.into_bytes()],
+            )
+            .map_err(DbError::storage)?;
+        self.state.index_ids.insert(name.to_lowercase(), id);
+        self.state.catalog.create_index(index)?;
+
+        let info = self.table_info(&table)?;
+        let built =
+            info.indexes.iter().find(|i| i.id == id).ok_or_else(|| {
+                DbError::Internal(format!("index {name} vanished while building"))
+            })?;
+        let rows = self
+            .source(txn)
+            .keyed_rows(&info.types, table_bounds(info.id))?;
+        for (key, row) in rows {
+            if built.def.unique {
+                self.probe_unique(&info, built, &row, txn)?;
+            }
+            if let Some(entry) = info.index_entry(built, key, &row) {
+                let record = info.index_record(built, &row)?;
+                self.tree
+                    .insert(txn, entry, vec![record])
+                    .map_err(DbError::storage)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_index(&mut self, name: &str, if_exists: bool, txn: u64) -> DbResult<StatementResult> {
+        let Ok(index) = self.state.catalog.get_index(name) else {
+            return if if_exists {
+                Ok(StatementResult::Done("DROP INDEX"))
+            } else {
+                Err(PlanError::IndexNotFound(name.to_string()).into())
+            };
+        };
+        if index.is_automatic() {
+            return Err(PlanError::Unsupported(format!(
+                "index {} enforces a constraint of table {} and cannot be dropped",
+                index.name, index.table
+            ))
+            .into());
+        }
+        let id = self
+            .state
+            .index_id(name)
+            .ok_or_else(|| DbError::Internal(format!("index {name} has no storage id")))?;
+        self.delete_range(object_bounds(id), txn)?;
+        self.tree
+            .delete(txn, tree_key(CATALOG_TABLE, id as u64))
+            .map_err(DbError::storage)?;
+        self.state.index_ids.remove(&name.to_lowercase());
+        self.state.catalog.drop_index(name);
+        Ok(StatementResult::Done("DROP INDEX"))
+    }
+
+    fn drop_table(&mut self, name: &str, if_exists: bool, txn: u64) -> DbResult<StatementResult> {
+        let Some((id, _)) = self.state.table(name) else {
+            return if if_exists {
+                Ok(StatementResult::Done("DROP TABLE"))
+            } else {
+                Err(PlanError::TableNotFound(name.to_string()).into())
+            };
+        };
+        let info = self.table_info(name)?;
+        for index in &info.indexes {
+            self.delete_range(object_bounds(index.id), txn)?;
+            self.tree
+                .delete(txn, tree_key(CATALOG_TABLE, index.id as u64))
+                .map_err(DbError::storage)?;
+            self.state.index_ids.remove(&index.def.name.to_lowercase());
+        }
+        self.delete_range(table_bounds(id), txn)?;
+        self.tree
+            .delete(txn, tree_key(CATALOG_TABLE, id as u64))
+            .map_err(DbError::storage)?;
+
+        self.state.table_ids.remove(&name.to_lowercase());
+        self.state.catalog.drop_table(name);
+        self.state.row_ids.remove(&id);
+        Ok(StatementResult::Done("DROP TABLE"))
+    }
+
+    fn alter_table(
+        &mut self,
+        table: &str,
+        action: AlterAction,
+        txn: u64,
+    ) -> DbResult<StatementResult> {
+        const DONE: StatementResult = StatementResult::Done("ALTER TABLE");
+        if action == AlterAction::Nothing {
+            return Ok(DONE);
+        }
+        let info = self.table_info(table)?;
+        let indexes = info.indexes.iter().map(|i| (i.id, i.def.clone()));
+        let (schema, indexes): (TableSchema, Vec<(ObjectId, IndexDef)>) = match action {
+            AlterAction::Nothing => return Ok(DONE),
+            AlterAction::AddColumn { column, fill } => {
+                let schema = info.schema.with_column_added(column)?;
+                let fill = PhysExpr::lower(&fill, &Schema::empty())?;
+                self.rewrite_rows(&info, &schema, txn, |row| {
+                    row.push(fill.eval(&[])?);
+                    Ok(())
+                })?;
+                (schema, indexes.collect())
+            }
+            AlterAction::DropColumn { column } => {
+                let schema = info.schema.with_column_dropped(column);
+                self.rewrite_rows(&info, &schema, txn, |row| {
+                    row.remove(column);
+                    Ok(())
+                })?;
+                let indexes = indexes
+                    .map(|(id, def)| (id, def.with_column_dropped(column)))
+                    .collect();
+                (schema, indexes)
+            }
+            AlterAction::RenameTable { name } => {
+                let indexes = indexes
+                    .map(|(id, def)| (id, def.for_table_named(&name)))
+                    .collect();
+                (info.schema.renamed(&name), indexes)
+            }
+            AlterAction::RenameColumn { column, name } => (
+                info.schema.with_column_renamed(column, &name)?,
+                indexes.collect(),
+            ),
+        };
+        self.replace_table(&info, schema, indexes, txn)?;
+        Ok(DONE)
+    }
+
+    fn rewrite_rows<F>(
+        &mut self,
+        info: &TableInfo,
+        schema: &TableSchema,
+        txn: u64,
+        mut change: F,
+    ) -> DbResult<()>
+    where
+        F: FnMut(&mut Row) -> DbResult<()>,
+    {
+        let next = TableInfo::new(&self.state.catalog, info.id, schema.clone(), Vec::new())?;
+        let rows = self
+            .source(txn)
+            .keyed_rows(&info.types, table_bounds(info.id))?;
+        for (key, mut row) in rows {
+            change(&mut row)?;
+            next.check_row(&row)?;
+            let bytes = next.encode(&row)?;
+            self.tree.delete(txn, key).map_err(DbError::storage)?;
+            self.tree
+                .insert(txn, key, vec![bytes])
+                .map_err(DbError::storage)?;
+        }
+        Ok(())
+    }
+
+    fn replace_table(
+        &mut self,
+        info: &TableInfo,
+        schema: TableSchema,
+        indexes: Vec<(ObjectId, IndexDef)>,
+        txn: u64,
+    ) -> DbResult<()> {
+        let mut entries = vec![(info.id, render_create_table(&schema))];
+        for (id, index) in &indexes {
+            entries.push((*id, render_create_index(index, &schema)));
+        }
+        for (id, ddl) in entries {
+            let key = tree_key(CATALOG_TABLE, id as u64);
+            self.tree.delete(txn, key).map_err(DbError::storage)?;
+            self.tree
+                .insert(txn, key, vec![ddl.into_bytes()])
+                .map_err(DbError::storage)?;
+        }
+
+        for index in &info.indexes {
+            self.state.index_ids.remove(&index.def.name.to_lowercase());
+        }
+        self.state.catalog.drop_table(&info.schema.name);
+        self.state
+            .table_ids
+            .remove(&info.schema.name.to_lowercase());
+        self.state
+            .table_ids
+            .insert(schema.name.to_lowercase(), info.id);
+        self.state.catalog.create_table(schema)?;
+        for (id, index) in indexes {
+            self.state.index_ids.insert(index.name.to_lowercase(), id);
+            self.state.catalog.create_index(index)?;
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, table: &str, input: &LogicalPlan, txn: u64) -> DbResult<StatementResult> {
+        let info = self.table_info(table)?;
+        let physical = self.physical(input)?;
+        let rows = execute_query(&physical, &self.source(txn))?;
+        let count = rows.len();
+        for row in rows {
+            self.insert_row(&info, row, txn)?;
+        }
+        Ok(StatementResult::Affected {
+            verb: "INSERT",
+            rows: count,
+        })
+    }
+
+    fn insert_row(&mut self, info: &TableInfo, row: Row, txn: u64) -> DbResult<()> {
+        info.check_row(&row)?;
+        let key = match info.key_of(&row)? {
+            Some(key) => key,
+            None => self.next_hidden_key(info, txn)?,
+        };
+        self.store_row(info, key, row, txn)
+    }
+
+    fn store_row(&mut self, info: &TableInfo, key: Key, row: Row, txn: u64) -> DbResult<()> {
+        if info.schema.integer_key_column().is_some()
+            && self.tree.contains(txn, key).map_err(DbError::storage)?
+        {
+            return Err(DbError::DuplicateKey {
+                table: info.schema.name.clone(),
+                key: info.describe_key(&row),
+            });
+        }
+        self.check_unique(info, &row, txn)?;
+        let bytes = info.encode(&row)?;
+        self.tree
+            .insert(txn, key, vec![bytes])
+            .map_err(DbError::storage)?;
+        for index in &info.indexes {
+            if let Some(entry) = info.index_entry(index, key, &row) {
+                let record = info.index_record(index, &row)?;
+                self.tree
+                    .insert(txn, entry, vec![record])
+                    .map_err(DbError::storage)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_row(&mut self, info: &TableInfo, key: Key, row: &[Value], txn: u64) -> DbResult<()> {
+        for index in &info.indexes {
+            if let Some(entry) = info.index_entry(index, key, row) {
+                self.tree.delete(txn, entry).map_err(DbError::storage)?;
+            }
+        }
+        self.tree.delete(txn, key).map_err(DbError::storage)
+    }
+
+    fn next_hidden_key(&mut self, info: &TableInfo, txn: u64) -> DbResult<Key> {
+        let next = match self.state.row_ids.get(&info.id) {
+            Some(next) => *next,
+            None => {
+                let (low, high) = table_bounds(info.id);
+                self.tree
+                    .last_key_in(txn, low, high)
+                    .map_err(DbError::storage)?
+                    .map_or(0, |key| row_bits(key) + 1)
+            }
+        };
+        if next > MAX_HIDDEN_ROW_ID {
+            return Err(DbError::KeyOutOfRange {
+                table: info.schema.name.clone(),
+                key: next as i64,
+            });
+        }
+        self.state.row_ids.insert(info.id, next + 1);
+        Ok(tree_key(info.id, next))
+    }
+
+    fn update(
+        &mut self,
+        table: &str,
+        input: &LogicalPlan,
+        assignments: &[UpdateAssignment],
+        txn: u64,
+    ) -> DbResult<StatementResult> {
+        let info = self.table_info(table)?;
+        let physical = self.physical(input)?;
+        let lowered: Vec<(usize, PhysExpr)> = assignments
+            .iter()
+            .map(|a| Ok((a.column, PhysExpr::lower(&a.value, physical.schema())?)))
+            .collect::<DbResult<_>>()?;
+
+        let targets = self.targets(&info, &physical, txn)?;
+        let mut updated: Vec<(Key, Row)> = Vec::with_capacity(targets.len());
+        let mut new_keys: HashSet<Key> = HashSet::with_capacity(targets.len());
+        for (old_key, old_row) in &targets {
+            let mut row = old_row.clone();
+            for (column, expr) in &lowered {
+                row[*column] = expr.eval(old_row)?;
+            }
+            info.check_row(&row)?;
+            let key = info.key_of(&row)?.unwrap_or(*old_key);
+            if !new_keys.insert(key) {
+                return Err(DbError::DuplicateKey {
+                    table: info.schema.name.clone(),
+                    key: info.describe_key(&row),
+                });
+            }
+            updated.push((key, row));
+        }
+
+        for (old_key, old_row) in &targets {
+            self.remove_row(&info, *old_key, old_row, txn)?;
+        }
+        for (key, row) in updated {
+            self.store_row(&info, key, row, txn)?;
+        }
+        Ok(StatementResult::Affected {
+            verb: "UPDATE",
+            rows: targets.len(),
+        })
+    }
+
+    fn delete(&mut self, table: &str, input: &LogicalPlan, txn: u64) -> DbResult<StatementResult> {
+        let info = self.table_info(table)?;
+        let physical = self.physical(input)?;
+        let targets = self.targets(&info, &physical, txn)?;
+        for (key, row) in &targets {
+            self.remove_row(&info, *key, row, txn)?;
+        }
+        Ok(StatementResult::Affected {
+            verb: "DELETE",
+            rows: targets.len(),
+        })
     }
 }
